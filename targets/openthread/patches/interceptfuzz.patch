@@ -1,0 +1,260 @@
+diff --git a/src/core/mac/mac_frame.cpp b/src/core/mac/mac_frame.cpp
+index 1cafa255e..52446f93a 100644
+--- a/src/core/mac/mac_frame.cpp
++++ b/src/core/mac/mac_frame.cpp
+@@ -1391,7 +1391,11 @@ void TxFrame::ProcessTransmitAesCcm(const ExtAddress &aExtAddress)
+ 
+     aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce));
+     aesCcm.Header(GetHeader(), GetHeaderLength());
++#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+     aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kEncrypt);
++#else
++    aesCcm.Payload(GetPayload(), nullptr, GetPayloadLength(), Crypto::AesCcm::kEncrypt);
++#endif
+     aesCcm.Finalize(GetFooter());
+ 
+     SetIsSecurityProcessed(true);
+diff --git a/src/core/thread/mle.cpp b/src/core/thread/mle.cpp
+index fd8656056..96c44754a 100644
+--- a/src/core/thread/mle.cpp
++++ b/src/core/thread/mle.cpp
+@@ -1489,12 +1489,13 @@ Error Mle::ProcessMessageSecurity(Crypto::AesCcm::Mode    aMode,
+     aesCcm.Header(aHeader);
+ 
+ #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+-    if (aMode == Crypto::AesCcm::kDecrypt)
+-    {
+-        // Skip decrypting the message under fuzz build mode
+-        aMessage.RemoveFooter(kMleSecurityTagSize);
+-        ExitNow();
+-    }
++    ExitNow();
++    // if (aMode == Crypto::AesCcm::kDecrypt)
++    // {
++    //     // Skip decrypting the message under fuzz build mode
++    //     aMessage.RemoveFooter(kMleSecurityTagSize);
++    //     ExitNow();
++    // }
+ #endif
+ 
+     aesCcm.Payload(aMessage, aCmdOffset, payloadLength, aMode);
+diff --git a/src/include/common/new.hpp b/src/include/common/new.hpp
+index bb49e3c64..cb3765b86 100644
+--- a/src/include/common/new.hpp
++++ b/src/include/common/new.hpp
+@@ -38,6 +38,7 @@
+ 
+ #include <openthread/platform/toolchain.h>
+ 
+-inline void *operator new(size_t, void *p) throw() { return p; }
++#include <memory>
++//inline void *operator new(size_t, void *p) throw() { return p; }
+ 
+ #endif // OT_INCLUDE_COMMON_NEW_HPP_
+diff --git a/tests/fuzz/CMakeLists.txt b/tests/fuzz/CMakeLists.txt
+index f8cb57939..f14710535 100644
+--- a/tests/fuzz/CMakeLists.txt
++++ b/tests/fuzz/CMakeLists.txt
+@@ -47,6 +47,14 @@ set(COMMON_LIBS
+     ot-config
+ )
+ 
++set(FUZZ_CXX_FLAGS
++    -O0
++    -g
++)
++
++find_package(InterceptFuzz CONFIG REQUIRED)
++
++
+ target_compile_definitions(ot-config INTERFACE "OPENTHREAD_CONFIG_RADIO_LINK_TREL_ENABLE=1")
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+@@ -71,18 +79,22 @@ macro(ot_nexus_test name)
+     target_link_libraries(${name}-fuzzer
+     PRIVATE
+         ${COMMON_LIBS}
++        InterceptFuzz::harness
+     )
+ 
+     target_compile_options(${name}-fuzzer
+     PRIVATE
+         ${COMMON_COMPILE_OPTIONS}
++        ${FUZZ_CXX_FLAGS}
+     )
+ endmacro()
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+-ot_nexus_test(icmp6)
+-ot_nexus_test(ip6)
+-ot_nexus_test(mdns)
+-ot_nexus_test(radio-one-node)
+-ot_nexus_test(trel)
++# ot_nexus_test(icmp6)
++# ot_nexus_test(ip6)
++# ot_nexus_test(mdns)
++# ot_nexus_test(radio-one-node)
++# ot_nexus_test(trel)
++
++ot_nexus_test(fuzz_test_form_join) # FUZZ
+diff --git a/tests/fuzz/fuzz_test_form_join.cpp b/tests/fuzz/fuzz_test_form_join.cpp
+new file mode 100644
+index 000000000..634374a9c
+--- /dev/null
++++ b/tests/fuzz/fuzz_test_form_join.cpp
+@@ -0,0 +1,81 @@
++/*
++ *  Copyright (c) 2024, The OpenThread Authors.
++ *  All rights reserved.
++ *
++ *  Redistribution and use in source and binary forms, with or without
++ *  modification, are permitted provided that the following conditions are met:
++ *  1. Redistributions of source code must retain the above copyright
++ *     notice, this list of conditions and the following disclaimer.
++ *  2. Redistributions in binary form must reproduce the above copyright
++ *     notice, this list of conditions and the following disclaimer in the
++ *     documentation and/or other materials provided with the distribution.
++ *  3. Neither the name of the copyright holder nor the
++ *     names of its contributors may be used to endorse or promote products
++ *     derived from this software without specific prior written permission.
++ *
++ *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ *  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ *  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ *  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ *  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ *  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ *  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ *  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ *  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ *  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ *  POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <iostream>
++#include <cstring>
++
++#include "platform/nexus_core.hpp"
++#include "platform/nexus_node.hpp"
++
++#include "InterceptFuzz/InterceptFuzz.hpp"
++
++namespace ot {
++namespace Nexus {
++
++size_t MaliciousNodeID_g = 0;
++bool AllNodesMalicious_g = true;
++
++void TestFormJoin(void)
++{
++    Core nexus;
++    Node &leader  = nexus.CreateNode();
++    Node &fed     = nexus.CreateNode();
++    
++#ifdef MALICIOUS_LEADER
++    MaliciousNodeID_g = leader.GetId(); // Let the Leader mutate the packets
++    AllNodesMalicious_g = false;
++#elif defined(MALICIOUS_FED)
++    MaliciousNodeID_g = fed.GetId(); // Let the Fed mutate the packets
++    AllNodesMalicious_g = false;
++#elif defined(MALICIOUS_BOTH)
++    #warning "Treating both nodes as malicious."
++    AllNodesMalicious_g = true;
++#else
++    #error "Please define one of MALICIOUS_LEADER, MALICIOUS_FED, or MALICIOUS_BOTH to specify which node(s) should be malicious."
++#endif
++
++    nexus.AdvanceTime(0);
++
++    leader.Form();
++    nexus.AdvanceTime(13 * 1000);
++
++    fed.Join(leader, Node::kAsFed);
++    nexus.AdvanceTime(5 * 1000);
++}
++
++} // namespace Nexus
++} // namespace ot
++
++INTERCEPTFUZZ_TEST(FormJoin)
++{
++    ot::Nexus::TestFormJoin();
++}
+diff --git a/tests/nexus/CMakeLists.txt b/tests/nexus/CMakeLists.txt
+index b70224027..2742c462f 100644
+--- a/tests/nexus/CMakeLists.txt
++++ b/tests/nexus/CMakeLists.txt
+@@ -61,10 +61,13 @@ target_compile_options(ot-nexus-platform
+         ${COMMON_COMPILE_OPTIONS}
+ )
+ 
++find_package(InterceptFuzz CONFIG REQUIRED)
++
+ target_link_libraries(ot-nexus-platform
+     PRIVATE
+         ot-config
+         ${OT_MBEDTLS}
++        InterceptFuzz::interceptfuzz
+ )
+ 
+ set(COMMON_LIBS
+@@ -76,6 +79,8 @@ set(COMMON_LIBS
+     openthread-ftd
+ )
+ 
++target_compile_definitions(ot-config INTERFACE "OPENTHREAD_CONFIG_RADIO_LINK_TREL_ENABLE=1")
++
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+ macro(ot_nexus_test name)
+@@ -111,9 +116,9 @@ endmacro()
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+-ot_nexus_test(border_agent)
+-ot_nexus_test(dtls)
+-ot_nexus_test(form_join)
+-ot_nexus_test(full_network_reset)
+-ot_nexus_test(large_network)
+-ot_nexus_test(trel)
++# ot_nexus_test(border_agent)
++# ot_nexus_test(dtls)
++# ot_nexus_test(form_join)
++# ot_nexus_test(full_network_reset)
++# ot_nexus_test(large_network)
++# ot_nexus_test(trel)
+diff --git a/tests/nexus/platform/nexus_core.cpp b/tests/nexus/platform/nexus_core.cpp
+index 34a18917b..47a408aa7 100644
+--- a/tests/nexus/platform/nexus_core.cpp
++++ b/tests/nexus/platform/nexus_core.cpp
+@@ -29,9 +29,14 @@
+ #include "nexus_core.hpp"
+ #include "nexus_node.hpp"
+ 
++#include "InterceptFuzz/InterceptFuzz.hpp"
++
+ namespace ot {
+ namespace Nexus {
+ 
++extern size_t MaliciousNodeID_g;
++extern bool AllNodesMalicious_g;
++
+ Core *Core::sCore  = nullptr;
+ bool  Core::sInUse = false;
+ 
+@@ -153,6 +158,10 @@ void Core::ProcessRadio(Node &aNode)
+ 
+             Radio::Frame rxFrame(aNode.mRadio.mTxFrame);
+ 
++            if (AllNodesMalicious_g || aNode.GetId() == MaliciousNodeID_g) {
++                rxFrame.mLength = InterceptFuzz::intercept(rxFrame.mPsduBuffer, rxFrame.mLength, OT_RADIO_FRAME_MAX_SIZE);
++            }
++
+             rxFrame.mInfo.mRxInfo.mTimestamp = (mNow.GetValue() * 1000u);
+             rxFrame.mInfo.mRxInfo.mRssi      = kDefaultRxRssi;
+             rxFrame.mInfo.mRxInfo.mLqi       = 0;

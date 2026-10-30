@@ -1,0 +1,16 @@
+# Campaign output of run_docker.sh / experiments/
+runs/
+# ccache shared with the containers
+.ccache/
+# Local build output
+fuzzers/aflnet/target/
+fuzzers/interceptfuzz/build/
+__pycache__/
+# Paper data (see results/README.md): the archives and their unpacked contents
+# live in results/ but are not committed
+results/*
+!results/README.md
+*.tar.gz
+*.tar.zst
+# Output of analysis/make_paper_results.sh
+paper_results/

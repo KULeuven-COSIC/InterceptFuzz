@@ -1,0 +1,12 @@
+[package]
+name = "netfuzzbench-common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+butterfly-fuzz = { path = "../butterfly" }
+libafl = "0.15.2"
+libafl_bolts = "0.15.2"
+log = "0.4"
+pcap = "2.2.0"
+serde = "1.0.219"

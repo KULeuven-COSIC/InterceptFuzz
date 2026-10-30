@@ -1,0 +1,9 @@
+runs/
+.ccache/
+results/
+fuzzers/aflnet/target/
+fuzzers/interceptfuzz/build/
+**/.git
+*.tar.gz
+*.tar.zst
+paper_results/

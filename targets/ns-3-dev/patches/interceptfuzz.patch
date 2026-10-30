@@ -1,0 +1,603 @@
+diff --git a/fuzz/minimal_lte_fuzz.cc b/fuzz/minimal_lte_fuzz.cc
+new file mode 100644
+index 000000000..d6b4a69d3
+--- /dev/null
++++ b/fuzz/minimal_lte_fuzz.cc
+@@ -0,0 +1,128 @@
++#include "ns3/core-module.h"
++#include "ns3/network-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/mobility-module.h"
++#include "ns3/lte-module.h"
++#include "ns3/point-to-point-module.h"
++#include <iostream>
++
++#include "InterceptFuzz/InterceptFuzz.hpp"
++
++using namespace ns3;
++
++// =========================================================================
++// TRACE CALLBACKS (Stop simulation immediately on attach outcome)
++// =========================================================================
++
++void NotifyConnectionEstablished(uint64_t imsi, uint16_t cellId, uint16_t rnti)
++{
++    std::cout << "\n======================================================\n";
++    std::cout << "[UE IMSI: " << imsi << "] Attach Procedure Complete!\n";
++    std::cout << "RRC Connection Established at: " << Simulator::Now().GetMilliSeconds() << " ms\n";
++    std::cout << "Halting simulation to prevent further traffic.\n";
++    std::cout << "======================================================\n\n";
++    
++    // Instantly halts the simulation clock
++    Simulator::Stop(); 
++}
++
++void NotifyConnectionTimeout(uint64_t imsi, uint16_t cellId, uint16_t rnti, uint8_t connEstFailCount)
++{
++    std::cout << "\n======================================================\n";
++    std::cout << "[UE IMSI: " << imsi << "] Attach FAILED! (Timeout / Max Retries reached)\n";
++    std::cout << "Failed at: " << Simulator::Now().GetMilliSeconds() << " ms\n";
++    std::cout << "Halting simulation early.\n";
++    std::cout << "======================================================\n\n";
++    
++    // Instantly halts the simulation clock
++    Simulator::Stop(); 
++}
++
++// =========================================================================
++// MAIN SIMULATION
++// =========================================================================
++// extern bool malicious_enb_g;
++// extern bool malicious_ue_g;
++
++int test_lte_attach()
++{
++    // CommandLine cmd(__FILE__);
++    // cmd.Parse(argc, argv);
++
++    // 1. Create nodes: one UE (Phone) and one eNodeB (Base Station)
++    NodeContainer ueNodes;
++    ueNodes.Create(1);
++
++    NodeContainer enbNodes;
++    enbNodes.Create(1);
++
++// #if defined(MALICIOUS_ENB)
++//     malicious_enb_g = true;
++// #elif defined(MALICIOUS_UE)
++//     malicious_ue_g = true;
++// #else
++// #error "You must define either MALICIOUS_ENB or MALICIOUS_UE during compilation"
++// #endif
++
++    // 2. Set up the LTE and EPC (Core Network) helpers
++    Ptr<LteHelper> lteHelper = CreateObject<LteHelper>();
++    lteHelper->SetAttribute("UseIdealRrc", BooleanValue(false));
++    Ptr<PointToPointEpcHelper> epcHelper = CreateObject<PointToPointEpcHelper>();
++    lteHelper->SetEpcHelper(epcHelper);
++
++    // 3. Set physical positions
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    mobility.Install(enbNodes);
++    mobility.Install(ueNodes);
++
++    // 4. Install LTE radio devices
++    NetDeviceContainer enbLteDevs = lteHelper->InstallEnbDevice(enbNodes);
++    NetDeviceContainer ueLteDevs = lteHelper->InstallUeDevice(ueNodes);
++
++    // 5. Install the Internet stack on the UE 
++    InternetStackHelper internet;
++    internet.Install(ueNodes);
++
++    // 6. Assign IP addresses and routing
++    Ipv4InterfaceContainer ueIpIface = epcHelper->AssignUeIpv4Address(NetDeviceContainer(ueLteDevs));
++    
++    Ipv4StaticRoutingHelper ipv4RoutingHelper;
++    // FIXED: Removed the ->GetRoutingProtocol() call
++    Ptr<Ipv4StaticRouting> ueStaticRouting = ipv4RoutingHelper.GetStaticRouting(ueNodes.Get(0)->GetObject<Ipv4>());
++    ueStaticRouting->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
++
++    // 7. Hook our custom callbacks into the UE's RRC state machine
++    Config::ConnectWithoutContext(
++        "/NodeList/*/DeviceList/*/$ns3::LteUeNetDevice/LteUeRrc/ConnectionEstablished",
++        MakeCallback(&NotifyConnectionEstablished)
++    );
++
++    Config::ConnectWithoutContext(
++        "/NodeList/*/DeviceList/*/$ns3::LteUeNetDevice/LteUeRrc/ConnectionTimeout",
++        MakeCallback(&NotifyConnectionTimeout)
++    );
++
++    // 8. Initiate the Attach Procedure
++    lteHelper->Attach(ueLteDevs, enbLteDevs.Get(0));
++
++    // 9. Fail-safe timeout (In case the state machine hangs elsewhere, cap it at 1 second)
++    Simulator::Stop(MilliSeconds(500));
++    
++    Simulator::Run();
++    Simulator::Destroy();
++
++    return 0;
++}
++
++INTERCEPTFUZZ_TEST(Scenario)
++{
++    // are identical for every execution path.
++    ns3::RngSeedManager::SetSeed(12345);
++    ns3::RngSeedManager::SetRun(1);
++
++    // 2. Disable unnecessary console logging (optional, but speeds up fuzzing)
++    ns3::LogComponentDisableAll(ns3::LOG_LEVEL_ALL);
++
++    test_lte_attach();
++}
+diff --git a/fuzz/minimal_wifi_fuzz.cc b/fuzz/minimal_wifi_fuzz.cc
+new file mode 100644
+index 000000000..de226ea5d
+--- /dev/null
++++ b/fuzz/minimal_wifi_fuzz.cc
+@@ -0,0 +1,90 @@
++#include "ns3/core-module.h"
++#include "ns3/network-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/mobility-module.h"
++#include "ns3/wifi-module.h"
++
++#include "InterceptFuzz/InterceptFuzz.hpp"
++
++using namespace ns3;
++
++// extern uint32_t malicious_node_id_g;
++
++int test_wifi_attach()
++{
++    // CommandLine cmd(__FILE__);
++    // cmd.Parse(argc, argv);
++    // 1. Create exactly two nodes
++    NodeContainer wifiStaNode;
++    wifiStaNode.Create(1);
++    NodeContainer wifiApNode;
++    wifiApNode.Create(1);
++
++// #if defined(MALICIOUS_STA)
++//     malicious_node_id_g = wifiStaNode.Get(0)->GetId();
++// #elif defined(MALICIOUS_AP)
++//     malicious_node_id_g = wifiApNode.Get(0)->GetId();
++// #else
++// #error "You must define either MALICIOUS_STA or MALICIOUS_AP during compilation"
++// #endif
++
++    // 2. Set up the physical Wi-Fi channel
++    YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
++    YansWifiPhyHelper phy;
++    phy.SetChannel(channel.Create());
++
++    // 3. Configure the MAC layer and SSID
++    WifiHelper wifi;
++    WifiMacHelper mac;
++    Ssid ssid = Ssid("fuzz-target");
++
++    // Configure the Station (Client)
++    mac.SetType("ns3::StaWifiMac",
++                "Ssid", SsidValue(ssid),
++                "ActiveProbing", BooleanValue(true)); // Forces Probe Requests
++    NetDeviceContainer staDevice = wifi.Install(phy, mac, wifiStaNode);
++
++    // Configure the Access Point (Router)
++    mac.SetType("ns3::ApWifiMac",
++                "Ssid", SsidValue(ssid));
++    NetDeviceContainer apDevice = wifi.Install(phy, mac, wifiApNode);
++
++    // 4. Set physical positions (Wi-Fi requires this to calculate signal strength)
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    mobility.Install(wifiApNode);
++    mobility.Install(wifiStaNode);
++
++    // 5. Install the Internet stack (IP addresses)
++    InternetStackHelper stack;
++    stack.Install(wifiApNode);
++    stack.Install(wifiStaNode);
++
++    Ipv4AddressHelper address;
++    address.SetBase("192.168.1.0", "255.255.255.0");
++    address.Assign(apDevice);
++    address.Assign(staDevice);
++
++    // 6. Enable PCAP tracing directly on the Access Point
++    // phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
++    // phy.EnablePcap("minimal-wifi-attach", apDevice.Get(0));
++
++    // 7. Run for just X ms.
++    Simulator::Stop(MilliSeconds(300));
++    Simulator::Run();
++    Simulator::Destroy();
++
++    return 0;
++}
++
++INTERCEPTFUZZ_TEST(Scenario)
++{
++    // are identical for every execution path.
++    ns3::RngSeedManager::SetSeed(12345);
++    ns3::RngSeedManager::SetRun(1);
++
++    // 2. Disable unnecessary console logging (optional, but speeds up fuzzing)
++    ns3::LogComponentDisableAll(ns3::LOG_LEVEL_ALL);
++
++    test_wifi_attach();
++}
+diff --git a/scratch/.gitignore b/scratch/.gitignore
+index 64892bfaf..50d1bab82 100644
+--- a/scratch/.gitignore
++++ b/scratch/.gitignore
+@@ -2,6 +2,7 @@
+ /*
+ !.gitignore
+ 
++!fuzz/
+ !nested-subdir/
+ !subdir/
+ !scratch-simulator.cc
+diff --git a/scratch/fuzz/CMakeLists.txt b/scratch/fuzz/CMakeLists.txt
+new file mode 100644
+index 000000000..c406ae1e2
+--- /dev/null
++++ b/scratch/fuzz/CMakeLists.txt
+@@ -0,0 +1,12 @@
++find_package(InterceptFuzz CONFIG REQUIRED)
++
++build_exec(
++  EXECNAME
++  target
++  SOURCE_FILES
++  target.cc
++  LIBRARIES_TO_LINK
++  "${ns3-libs}"
++  InterceptFuzz::harness
++  EXECUTABLE_DIRECTORY_PATH
++  ${CMAKE_OUTPUT_DIRECTORY}/scratch/fuzz)
+diff --git a/scratch/fuzz/target.cc b/scratch/fuzz/target.cc
+new file mode 100644
+index 000000000..de226ea5d
+--- /dev/null
++++ b/scratch/fuzz/target.cc
+@@ -0,0 +1,90 @@
++#include "ns3/core-module.h"
++#include "ns3/network-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/mobility-module.h"
++#include "ns3/wifi-module.h"
++
++#include "InterceptFuzz/InterceptFuzz.hpp"
++
++using namespace ns3;
++
++// extern uint32_t malicious_node_id_g;
++
++int test_wifi_attach()
++{
++    // CommandLine cmd(__FILE__);
++    // cmd.Parse(argc, argv);
++    // 1. Create exactly two nodes
++    NodeContainer wifiStaNode;
++    wifiStaNode.Create(1);
++    NodeContainer wifiApNode;
++    wifiApNode.Create(1);
++
++// #if defined(MALICIOUS_STA)
++//     malicious_node_id_g = wifiStaNode.Get(0)->GetId();
++// #elif defined(MALICIOUS_AP)
++//     malicious_node_id_g = wifiApNode.Get(0)->GetId();
++// #else
++// #error "You must define either MALICIOUS_STA or MALICIOUS_AP during compilation"
++// #endif
++
++    // 2. Set up the physical Wi-Fi channel
++    YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
++    YansWifiPhyHelper phy;
++    phy.SetChannel(channel.Create());
++
++    // 3. Configure the MAC layer and SSID
++    WifiHelper wifi;
++    WifiMacHelper mac;
++    Ssid ssid = Ssid("fuzz-target");
++
++    // Configure the Station (Client)
++    mac.SetType("ns3::StaWifiMac",
++                "Ssid", SsidValue(ssid),
++                "ActiveProbing", BooleanValue(true)); // Forces Probe Requests
++    NetDeviceContainer staDevice = wifi.Install(phy, mac, wifiStaNode);
++
++    // Configure the Access Point (Router)
++    mac.SetType("ns3::ApWifiMac",
++                "Ssid", SsidValue(ssid));
++    NetDeviceContainer apDevice = wifi.Install(phy, mac, wifiApNode);
++
++    // 4. Set physical positions (Wi-Fi requires this to calculate signal strength)
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    mobility.Install(wifiApNode);
++    mobility.Install(wifiStaNode);
++
++    // 5. Install the Internet stack (IP addresses)
++    InternetStackHelper stack;
++    stack.Install(wifiApNode);
++    stack.Install(wifiStaNode);
++
++    Ipv4AddressHelper address;
++    address.SetBase("192.168.1.0", "255.255.255.0");
++    address.Assign(apDevice);
++    address.Assign(staDevice);
++
++    // 6. Enable PCAP tracing directly on the Access Point
++    // phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
++    // phy.EnablePcap("minimal-wifi-attach", apDevice.Get(0));
++
++    // 7. Run for just X ms.
++    Simulator::Stop(MilliSeconds(300));
++    Simulator::Run();
++    Simulator::Destroy();
++
++    return 0;
++}
++
++INTERCEPTFUZZ_TEST(Scenario)
++{
++    // are identical for every execution path.
++    ns3::RngSeedManager::SetSeed(12345);
++    ns3::RngSeedManager::SetRun(1);
++
++    // 2. Disable unnecessary console logging (optional, but speeds up fuzzing)
++    ns3::LogComponentDisableAll(ns3::LOG_LEVEL_ALL);
++
++    test_wifi_attach();
++}
+diff --git a/src/lte/CMakeLists.txt b/src/lte/CMakeLists.txt
+index 0d29465d5..7a4529d74 100644
+--- a/src/lte/CMakeLists.txt
++++ b/src/lte/CMakeLists.txt
+@@ -368,3 +368,6 @@ build_lib(
+   MODULE_ENABLED_FEATURES ${emu_features}
+   GENERATE_EXPORT_HEADER
+ )
++
++find_package(InterceptFuzz CONFIG REQUIRED)
++target_link_libraries(${liblte} PUBLIC InterceptFuzz::interceptfuzz)
+diff --git a/src/lte/model/lte-rrc-protocol-real.cc b/src/lte/model/lte-rrc-protocol-real.cc
+index 86173a6ef..305bbcd43 100644
+--- a/src/lte/model/lte-rrc-protocol-real.cc
++++ b/src/lte/model/lte-rrc-protocol-real.cc
+@@ -22,9 +22,23 @@
+ #include "ns3/nstime.h"
+ #include "ns3/simulator.h"
+ 
++#include <vector>
++
++#include "InterceptFuzz/InterceptFuzz.hpp"
++
+ namespace ns3
+ {
+ 
++// Hands the bytes of an RRC message to InterceptFuzz and wraps the result in a new packet.
++static Ptr<Packet>
++MutatePacketWithFuzzer(Ptr<Packet> packet, uint32_t max_len)
++{
++    std::vector<uint8_t> bytes(packet->GetSize());
++    packet->CopyData(bytes.data(), bytes.size());
++    std::vector<uint8_t> fuzzed = InterceptFuzz::intercept_copy(bytes.data(), bytes.size(), max_len);
++    return Create<Packet>(fuzzed.data(), fuzzed.size());
++}
++
+ NS_LOG_COMPONENT_DEFINE("LteRrcProtocolReal");
+ 
+ /// RRC real message delay
+@@ -109,7 +123,7 @@ LteUeRrcProtocolReal::DoSendRrcConnectionRequest(LteRrcSap::RrcConnectionRequest
+     rrcConnectionRequestHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionRequestHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 2048);
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = m_rnti;
+@@ -128,7 +142,7 @@ LteUeRrcProtocolReal::DoSendRrcConnectionSetupCompleted(
+     rrcConnectionSetupCompleteHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionSetupCompleteHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 8192);
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = m_rnti;
+@@ -155,7 +169,7 @@ LteUeRrcProtocolReal::DoSendRrcConnectionReconfigurationCompleted(
+     rrcConnectionReconfigurationCompleteHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReconfigurationCompleteHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 8192);
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = m_rnti;
+@@ -178,7 +192,7 @@ LteUeRrcProtocolReal::DoSendMeasurementReport(LteRrcSap::MeasurementReport msg)
+     measurementReportHeader.SetMessage(msg);
+ 
+     packet->AddHeader(measurementReportHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 8192);
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = m_rnti;
+@@ -219,7 +233,7 @@ LteUeRrcProtocolReal::DoSendRrcConnectionReestablishmentRequest(
+     rrcConnectionReestablishmentRequestHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentRequestHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 2048);
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = m_rnti;
+@@ -238,6 +252,7 @@ LteUeRrcProtocolReal::DoSendRrcConnectionReestablishmentComplete(
+     rrcConnectionReestablishmentCompleteHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentCompleteHeader);
++    packet = MutatePacketWithFuzzer(packet, 2048);
+ 
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+@@ -563,7 +578,7 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionSetup(uint16_t rnti, LteRrcSap::RrcCon
+     rrcConnectionSetupHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionSetupHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 2048);
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+@@ -581,7 +596,7 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReject(uint16_t rnti, LteRrcSap::RrcCo
+     rrcConnectionRejectHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionRejectHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 2048);
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+@@ -601,7 +616,7 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReconfiguration(
+     rrcConnectionReconfigurationHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReconfigurationHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 8192);
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = rnti;
+@@ -621,7 +636,7 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReestablishment(
+     rrcConnectionReestablishmentHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 2048);
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+@@ -641,7 +656,7 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReestablishmentReject(
+     rrcConnectionReestablishmentRejectHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentRejectHeader);
+-
++    packet = MutatePacketWithFuzzer(packet, 2048);
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+diff --git a/src/wifi/CMakeLists.txt b/src/wifi/CMakeLists.txt
+index db136ed75..91fa6711f 100644
+--- a/src/wifi/CMakeLists.txt
++++ b/src/wifi/CMakeLists.txt
+@@ -449,3 +449,6 @@ build_lib(
+   TEST_LIBRARIES_TO_LINK ${applications_lib}
+   GENERATE_EXPORT_HEADER
+ )
++
++find_package(InterceptFuzz CONFIG REQUIRED)
++target_link_libraries(${libwifi} PUBLIC InterceptFuzz::interceptfuzz)
+diff --git a/src/wifi/model/wifi-mac-queue.cc b/src/wifi/model/wifi-mac-queue.cc
+index 64f0e3456..336bd38c5 100644
+--- a/src/wifi/model/wifi-mac-queue.cc
++++ b/src/wifi/model/wifi-mac-queue.cc
+@@ -18,6 +18,8 @@
+ #include <functional>
+ #include <optional>
+ 
++#include "InterceptFuzz/InterceptFuzz.hpp"
++
+ namespace ns3
+ {
+ 
+@@ -26,6 +28,23 @@ NS_LOG_COMPONENT_DEFINE("WifiMacQueue");
+ NS_OBJECT_ENSURE_REGISTERED(WifiMacQueue);
+ NS_OBJECT_TEMPLATE_CLASS_TWO_DEFINE(Queue, WifiMpdu, WifiMacQueueContainer);
+ 
++// --- DEBUG HEX PRINTER HELPER ---
++static void PrintHexBuffer(const std::string& label, const uint8_t* buffer, uint32_t size)
++{
++    std::cout << "--- " << label << " (" << size << " bytes) ---\n";
++    if (size == 0)
++    {
++        std::cout << "(Empty)\n";
++        return;
++    }
++    for (uint32_t i = 0; i < size; i++) {
++        printf("%02x ", buffer[i]);
++        if ((i + 1) % 16 == 0) std::cout << "\n";
++    }
++    if (size % 16 != 0) std::cout << "\n";
++}
++// --------------------------------
++
+ TypeId
+ WifiMacQueue::GetTypeId()
+ {
+@@ -222,7 +241,61 @@ bool
+ WifiMacQueue::Enqueue(Ptr<WifiMpdu> item)
+ {
+     NS_LOG_FUNCTION(this << *item);
++    // 1. Extract the separated Header and Payload
++    const WifiMacHeader& macHeader = item->GetHeader();
++    Ptr<const Packet> payload = item->GetPacket();
++
++    uint32_t senderNodeId = Simulator::GetContext();
++
++    // std::cout << "\n=================================================\n";
++    // std::cout << "[MAC QUEUE] Packet Intercepted\n";
+ 
++    // 2. Serialize and Print the MAC Header (The part you will KEEP)
++    uint32_t headerSize = macHeader.GetSerializedSize();
++    if (headerSize > 0)
++    {
++        Buffer headerBuffer;
++        headerBuffer.AddAtStart(headerSize);
++        macHeader.Serialize(headerBuffer.Begin());
++        
++        // uint8_t* hBytes = new uint8_t[headerSize];
++        // headerBuffer.CopyData(hBytes, headerSize);
++        // PrintHexBuffer("MAC Header", hBytes, headerSize);
++        // delete[] hBytes;
++    }
++
++    // // 3. Print the Original Payload 
++    uint32_t payloadSize = payload->GetSize();
++    
++    std::cout << "Sender ID: " << senderNodeId << std::endl;
++    if (payloadSize > 0)
++    {
++        uint8_t* pBytes = new uint8_t[payloadSize];
++        payload->CopyData(pBytes, payloadSize);
++        PrintHexBuffer("Original Payload", pBytes, payloadSize);
++        delete[] pBytes;
++    }
++    // else 
++    // {
++    //     std::cout << "(Empty Payload)\n";
++    // }
++    // std::cout << "=================================================\n";
++
++    // --- 4. YOUR UNIVERSAL FUZZER INJECTION ---
++    // We only attempt to fuzz if there is an actual payload to mutate.
++    // Frames like pure ACKs or CTS have 0 payload size.
++    //if (senderNodeId == malicious_node_id_g && payloadSize > 0)
++    if (payloadSize > 0)
++    {
++        std::cout << "\n[FUZZER] Packet with payload detected! Passing to fuzz()...\n";
++
++        std::vector<uint8_t> bytes(payloadSize);
++        payload->CopyData(bytes.data(), payloadSize);
++        std::vector<uint8_t> fuzzed = InterceptFuzz::intercept_copy(bytes.data(), payloadSize, 1500); // Wi-Fi MTU
++
++        // Same MAC header, fuzzed payload
++        item = Create<WifiMpdu>(Create<Packet>(fuzzed.data(), fuzzed.size()), macHeader);
++    }
+     auto queueId = WifiMacQueueContainer::GetQueueId(item);
+     return Insert(GetContainer().GetQueue(queueId).cend(), item);
+ }

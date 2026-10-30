@@ -1,0 +1,936 @@
+diff --git a/src/core/common/log.hpp b/src/core/common/log.hpp
+index 9819c3d36..e1c58c034 100644
+--- a/src/core/common/log.hpp
++++ b/src/core/common/log.hpp
+@@ -49,7 +49,13 @@ namespace ot {
+  *
+  * This definition indicates whether or not logging is enabled.
+  */
+-#define OT_SHOULD_LOG (OPENTHREAD_CONFIG_LOG_OUTPUT != OPENTHREAD_CONFIG_LOG_OUTPUT_NONE)
++#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
++    // Completely disable logging during fuzzing
++    #define OT_SHOULD_LOG 0
++#else
++    // Normal production logging logic
++    #define OT_SHOULD_LOG (OPENTHREAD_CONFIG_LOG_OUTPUT != OPENTHREAD_CONFIG_LOG_OUTPUT_NONE)
++#endif
+ 
+ /**
+  * Indicates whether the OpenThread logging is enabled at a given log level.
+diff --git a/src/core/mac/mac_frame.cpp b/src/core/mac/mac_frame.cpp
+index 1cafa255e..52446f93a 100644
+--- a/src/core/mac/mac_frame.cpp
++++ b/src/core/mac/mac_frame.cpp
+@@ -1391,7 +1391,11 @@ void TxFrame::ProcessTransmitAesCcm(const ExtAddress &aExtAddress)
+ 
+     aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce));
+     aesCcm.Header(GetHeader(), GetHeaderLength());
++#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+     aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kEncrypt);
++#else
++    aesCcm.Payload(GetPayload(), nullptr, GetPayloadLength(), Crypto::AesCcm::kEncrypt);
++#endif
+     aesCcm.Finalize(GetFooter());
+ 
+     SetIsSecurityProcessed(true);
+diff --git a/src/core/thread/mle.cpp b/src/core/thread/mle.cpp
+index fd8656056..96c44754a 100644
+--- a/src/core/thread/mle.cpp
++++ b/src/core/thread/mle.cpp
+@@ -1489,12 +1489,13 @@ Error Mle::ProcessMessageSecurity(Crypto::AesCcm::Mode    aMode,
+     aesCcm.Header(aHeader);
+ 
+ #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+-    if (aMode == Crypto::AesCcm::kDecrypt)
+-    {
+-        // Skip decrypting the message under fuzz build mode
+-        aMessage.RemoveFooter(kMleSecurityTagSize);
+-        ExitNow();
+-    }
++    ExitNow();
++    // if (aMode == Crypto::AesCcm::kDecrypt)
++    // {
++    //     // Skip decrypting the message under fuzz build mode
++    //     aMessage.RemoveFooter(kMleSecurityTagSize);
++    //     ExitNow();
++    // }
+ #endif
+ 
+     aesCcm.Payload(aMessage, aCmdOffset, payloadLength, aMode);
+diff --git a/src/include/common/new.hpp b/src/include/common/new.hpp
+index bb49e3c64..cb3765b86 100644
+--- a/src/include/common/new.hpp
++++ b/src/include/common/new.hpp
+@@ -38,6 +38,7 @@
+ 
+ #include <openthread/platform/toolchain.h>
+ 
+-inline void *operator new(size_t, void *p) throw() { return p; }
++#include <memory>
++//inline void *operator new(size_t, void *p) throw() { return p; }
+ 
+ #endif // OT_INCLUDE_COMMON_NEW_HPP_
+diff --git a/tests/fuzz/CMakeLists.txt b/tests/fuzz/CMakeLists.txt
+index f8cb57939..6ea6da52f 100644
+--- a/tests/fuzz/CMakeLists.txt
++++ b/tests/fuzz/CMakeLists.txt
+@@ -47,6 +47,15 @@ set(COMMON_LIBS
+     ot-config
+ )
+ 
++set(FUZZ_CXX_FLAGS
++	-O3
++    -fsanitize=fuzzer
++)
++set(FUZZ_LINK_FLAGS
++    -fsanitize=fuzzer
++    -lpthread -ldl -lm
++)
++
+ target_compile_definitions(ot-config INTERFACE "OPENTHREAD_CONFIG_RADIO_LINK_TREL_ENABLE=1")
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+@@ -71,18 +80,22 @@ macro(ot_nexus_test name)
+     target_link_libraries(${name}-fuzzer
+     PRIVATE
+         ${COMMON_LIBS}
++        ${FUZZ_LINK_FLAGS}
+     )
+ 
+     target_compile_options(${name}-fuzzer
+     PRIVATE
+         ${COMMON_COMPILE_OPTIONS}
++        ${FUZZ_CXX_FLAGS}
+     )
+ endmacro()
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+-ot_nexus_test(icmp6)
+-ot_nexus_test(ip6)
+-ot_nexus_test(mdns)
+-ot_nexus_test(radio-one-node)
+-ot_nexus_test(trel)
++# ot_nexus_test(icmp6)
++# ot_nexus_test(ip6)
++# ot_nexus_test(mdns)
++# ot_nexus_test(radio-one-node)
++# ot_nexus_test(trel)
++
++ot_nexus_test(fuzz_test_form_join) # FUZZ
+diff --git a/tests/fuzz/fuzz_parser_configuration.h b/tests/fuzz/fuzz_parser_configuration.h
+new file mode 100644
+index 000000000..1fb9fe08a
+--- /dev/null
++++ b/tests/fuzz/fuzz_parser_configuration.h
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include <iostream>
++#include <vector>
++#include <cstdint>
++
++enum class Endian { Big, Little };
++
++// Toggle whether the payload includes a total length prefix at the very beginning
++constexpr bool HAS_TOTAL_LEN_PREFIX = true;
++
++// Define the byte-sizes by setting the underlying integer types.
++using TotalLenType = uint32_t; 
++using PktLenType   = uint32_t; 
++
++// Set the endianness of the incoming fuzzer payload
++constexpr Endian ENCODING = Endian::Big;
++
++// =========================================================================
++// TEMPLATED READER FUNCTION
++// =========================================================================
++// This single function automatically adapts to the byte-size of the type (T) 
++// and the chosen endianness without any runtime overhead.
++template <typename T, Endian E = ENCODING>
++inline T read_len(const uint8_t* buf) {
++    T result = 0;
++    if constexpr (E == Endian::Big) {
++        for (size_t i = 0; i < sizeof(T); ++i) {
++            result = (result << 8) | buf[i];
++        }
++    } else {
++        for (size_t i = 0; i < sizeof(T); ++i) {
++            result |= (static_cast<T>(buf[i]) << (i * 8));
++        }
++    }
++    return result;
++}
+\ No newline at end of file
+diff --git a/tests/fuzz/fuzz_test_form_join.cpp b/tests/fuzz/fuzz_test_form_join.cpp
+new file mode 100644
+index 000000000..db93f0e52
+--- /dev/null
++++ b/tests/fuzz/fuzz_test_form_join.cpp
+@@ -0,0 +1,210 @@
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#include <iostream>
++#include <vector>
++#include <unistd.h>
++#include <sys/shm.h>
++#include <algorithm>
++
++#include "platform/nexus_core.hpp"
++#include "platform/nexus_node.hpp"
++
++#include "platform/thread_dissector.hpp"
++
++#include "fuzz_parser_configuration.h"
++
++// =========================================================================
++// THE "IN-PROCESS BRAIN" STATE
++// =========================================================================
++std::vector<std::vector<uint8_t>> g_input_queue;
++size_t g_input_index = 0;
++
++uint8_t* g_outbox_ptr = nullptr;
++const size_t OUTBOX_CAPACITY = 1024 * 1024; // 1MB
++
++// =========================================================================
++// PHASE 1: IPC ATTACHMENT
++// =========================================================================
++
++void setup_outbox() {
++    if (g_outbox_ptr != nullptr) return; 
++
++    const char* shm_id_str = getenv("OUTBOX_SHMEM_ID");
++    if (shm_id_str) {
++        int shm_id = atoi(shm_id_str);
++        g_outbox_ptr = (uint8_t*)shmat(shm_id, NULL, 0);
++    }
++}
++
++// =========================================================================
++// PHASE 2: THE REVERSE IPC (TRACE WRITER)
++// =========================================================================
++extern "C" void write_trace_to_outbox(uint8_t direction, uint8_t packet_type, const uint8_t* packet, size_t len) {
++    if (!g_outbox_ptr) {
++        return;
++    }
++
++    uint32_t* total_bytes_ptr = (uint32_t*)g_outbox_ptr;
++    uint32_t current_offset = *total_bytes_ptr;
++
++    // Header size is now 6 bytes: [1b Dir] + [1b Type] + [4b Length]
++    if (4 + current_offset + 6 + len <= OUTBOX_CAPACITY) {
++        uint8_t* write_ptr = g_outbox_ptr + 4 + current_offset;
++        
++        // 1. Write Direction
++        write_ptr[0] = direction;
++        
++        // 2. Write Type
++        write_ptr[1] = packet_type;
++        
++        // 3. Write 4-byte Length in Big-Endian (BE)
++        write_ptr[2] = (uint8_t)((len >> 24) & 0xFF);
++        write_ptr[3] = (uint8_t)((len >> 16) & 0xFF);
++        write_ptr[4] = (uint8_t)((len >> 8) & 0xFF);
++        write_ptr[5] = (uint8_t)(len & 0xFF);
++        
++        // 4. Append the payload
++        if (len > 0 && packet != nullptr) {
++            memcpy(write_ptr + 6, packet, len);
++        }
++        
++        // Update the global total bytes counter
++        *total_bytes_ptr += (6 + len);
++    }
++}
++
++// =========================================================================
++// PHASE 3: THE INJECTOR 
++// =========================================================================
++
++extern "C" size_t libafl_process(uint8_t* buf, size_t buf_len, size_t max_len) {
++    // 1. ACTION (INJECTION): Replace OpenThread's buffer with our mutated packet
++    if (g_input_index < g_input_queue.size()) {
++        const auto& packet = g_input_queue[g_input_index];
++        size_t copy_len = std::min(packet.size(), max_len);
++        memcpy(buf, packet.data(), copy_len);
++        
++        g_input_index++;
++        return copy_len;
++    } 
++
++    // If queue is empty, let the target use its original packet
++    return buf_len; 
++}
++
++// =========================================================================
++// THE OPENTHREAD TARGET
++// =========================================================================
++
++namespace ot {
++namespace Nexus {
++
++// Globals exposed to the external interception hooks
++size_t MaliciousNodeID_g = 0;
++size_t TargetNodeID_g = 0;
++bool AllNodesMalicious_g = false;
++
++void TestFormJoin(void)
++{
++    Core nexus;
++    Node &leader  = nexus.CreateNode();
++    Node &fed     = nexus.CreateNode();
++
++    // Assign roles for the external hooks to use
++#ifdef MALICIOUS_LEADER
++    MaliciousNodeID_g = leader.GetId(); // The Injector (Fuzzer)
++    TargetNodeID_g = fed.GetId(); // The Observer (Target)
++    AllNodesMalicious_g = false;
++#elif defined(MALICIOUS_FED)
++    MaliciousNodeID_g = fed.GetId(); // The Injector (Fuzzer)
++    TargetNodeID_g = leader.GetId(); // The Observer (Target)
++    AllNodesMalicious_g = false;
++#elif defined(MALICIOUS_BOTH)
++    #warning "Treating both nodes as malicious."
++    AllNodesMalicious_g = true;
++#else
++    #error "Please define one of MALICIOUS_LEADER, MALICIOUS_FED, or MALICIOUS_BOTH to specify which node(s) should be malicious."
++#endif
++
++    nexus.AdvanceTime(0);
++
++    leader.Form();
++    nexus.AdvanceTime(13 * 1000);
++
++    fed.Join(leader, Node::kAsFed);
++    nexus.AdvanceTime(5 * 1000);
++}
++
++} 
++} 
++
++// =========================================================================
++// LLVM LIBFUZZER API ENTRY POINTS
++// =========================================================================
++
++extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
++    setup_outbox();
++    return 0;
++}
++
++extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
++
++    thread_dissector::Reset();
++    srand(0U);
++
++    // CRITICAL: Reset the Outbox at the start of every single run!
++    if (g_outbox_ptr != nullptr) {
++        *((uint32_t*)g_outbox_ptr) = 0; 
++    }
++
++    // 1. Reset state 
++    g_input_queue.clear();
++    g_input_index = 0;
++
++    // 2. Parse the TLV format sequence
++    size_t cursor = 0;
++    // 1. Process the total length prefix (if enabled)
++    if constexpr (HAS_TOTAL_LEN_PREFIX) {
++        if (size < sizeof(TotalLenType)) {
++            return 0; // Payload too small to even contain the total length header
++        }
++        
++        TotalLenType expected_len = read_len<TotalLenType>(data);
++        size_t expected_size = static_cast<size_t>(expected_len) + sizeof(TotalLenType);
++        if (size != expected_size) {
++            std::cerr << "SIZE MISMATCH! Expected: " << expected_size << "; Got " << size << "" << std::endl;
++            return -1;
++        }
++        cursor += sizeof(TotalLenType);
++    }
++
++    // 2. Parse individual packets.
++    while (cursor + sizeof(PktLenType) <= size) {
++        PktLenType len = read_len<PktLenType>(&data[cursor]);
++        cursor += sizeof(PktLenType);
++
++        if (cursor + len <= size) {
++            // Ignore 0-byte payloads
++            if (len > 0) {
++                // Ensure the parsed packet does not exceed OpenThread's max frame size
++                size_t actual_len = std::min(static_cast<size_t>(len), static_cast<size_t>(OT_RADIO_FRAME_MAX_SIZE));
++                
++                // emplace_back is slightly more efficient than push_back here
++                g_input_queue.emplace_back(
++                    data + cursor, 
++                    data + cursor + actual_len
++                );
++            }
++            // Always advance by the original 'len' to keep TLV stream in sync for the next packet
++            cursor += len; 
++        } else {
++            break; // Truncated/corrupted payload, stop parsing safely
++        }
++    }
++
++    // 3. Execute the target sequence
++    ot::Nexus::TestFormJoin();
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/tests/nexus/CMakeLists.txt b/tests/nexus/CMakeLists.txt
+index b70224027..615deb267 100644
+--- a/tests/nexus/CMakeLists.txt
++++ b/tests/nexus/CMakeLists.txt
+@@ -76,6 +76,8 @@ set(COMMON_LIBS
+     openthread-ftd
+ )
+ 
++target_compile_definitions(ot-config INTERFACE "OPENTHREAD_CONFIG_RADIO_LINK_TREL_ENABLE=1")
++
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+ macro(ot_nexus_test name)
+@@ -111,9 +113,9 @@ endmacro()
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+-ot_nexus_test(border_agent)
+-ot_nexus_test(dtls)
+-ot_nexus_test(form_join)
+-ot_nexus_test(full_network_reset)
+-ot_nexus_test(large_network)
+-ot_nexus_test(trel)
++# ot_nexus_test(border_agent)
++# ot_nexus_test(dtls)
++# ot_nexus_test(form_join)
++# ot_nexus_test(full_network_reset)
++# ot_nexus_test(large_network)
++# ot_nexus_test(trel)
+diff --git a/tests/nexus/platform/nexus_core.cpp b/tests/nexus/platform/nexus_core.cpp
+index 34a18917b..6cf0878fa 100644
+--- a/tests/nexus/platform/nexus_core.cpp
++++ b/tests/nexus/platform/nexus_core.cpp
+@@ -29,9 +29,18 @@
+ #include "nexus_core.hpp"
+ #include "nexus_node.hpp"
+ 
++#include "thread_dissector.hpp"
++
++extern "C" size_t libafl_process(uint8_t* buf, size_t buf_len, size_t max_len);
++extern "C" void write_trace_to_outbox(uint8_t direction, uint8_t packet_type, const uint8_t* packet, size_t len);
++
+ namespace ot {
+ namespace Nexus {
+ 
++extern size_t MaliciousNodeID_g;
++extern size_t TargetNodeID_g;
++extern bool AllNodesMalicious_g;
++
+ Core *Core::sCore  = nullptr;
+ bool  Core::sInUse = false;
+ 
+@@ -113,6 +122,69 @@ void Core::Process(Node &aNode)
+     }
+ }
+ 
++// #define CMD_LINK_REQUEST 0x00
++// #define CMD_ADVERTISEMENT 0x04
++// #define CMD_DATA_REQUEST 0x07
++// #define CMD_DATA_RESPONSE 0x08
++// #define CMD_PARENT_REQUEST 0x09
++// #define CMD_PARENT_RESPONSE 0x0a
++// #define CMD_CHILD_ID_REQUEST 0x0b
++// #define CMD_CHILD_ID_RESPONSE 0x0c
++// #define CMD_CHILD_UPDATE_REQUEST 0x0d
++// #define CMD_CHILD_UPDATE_RESPONSE 0x0e
++
++// static const char* get_mle_command_name(uint8_t type) {
++//     switch (type) {
++//         case CMD_LINK_REQUEST:          return "LINK_REQUEST";
++//         case CMD_ADVERTISEMENT:         return "ADVERTISEMENT";
++//         case CMD_DATA_REQUEST:          return "DATA_REQUEST";
++//         case CMD_DATA_RESPONSE:         return "DATA_RESPONSE";
++//         case CMD_PARENT_REQUEST:        return "PARENT_REQUEST";
++//         case CMD_PARENT_RESPONSE:       return "PARENT_RESPONSE";
++//         case CMD_CHILD_ID_REQUEST:      return "CHILD_ID_REQUEST";
++//         case CMD_CHILD_ID_RESPONSE:     return "CHILD_ID_RESPONSE";
++//         case CMD_CHILD_UPDATE_REQUEST:  return "CHILD_UPDATE_REQUEST";
++//         case CMD_CHILD_UPDATE_RESPONSE: return "CHILD_UPDATE_RESPONSE";
++//         default:                        return "UNKNOWN_COMMAND";
++//     }
++// }
++
++// static void quick_dissect(const uint8_t* data, size_t size) {
++//     int mle_start = -1;
++
++//     // 1. Sliding window to find the 6LoWPAN UDP Header for Port 19788
++//     // Signature: F0 (NHC) | 4D 4C (Src Port) | 4D 4C (Dst Port)
++//     for (size_t i = 0; i + 4 < size; i++) {
++//         if (data[i] == 0xF0 && data[i+1] == 0x4D && data[i+2] == 0x4C &&
++//             data[i+3] == 0x4D && data[i+4] == 0x4C) {
++            
++//             // The UDP header is 7 bytes long (5 byte signature + 2 byte Checksum)
++//             mle_start = i + 7;
++//             break;
++//         }
++//     }
++
++//     if (mle_start == -1) {
++//         printf("Packet Type: [UNKNOWN] (MLE signature not found)\n");
++//         return;
++//     }
++
++//     // 2. Extract the MLE Command Type
++//     // The type byte is exactly at offset 11 from the start of the MLE payload.
++//     if (mle_start + 11 < size) {
++//         uint8_t message_type = data[mle_start + 11];
++//         const char* type_name = get_mle_command_name(message_type);
++        
++//         printf("Packet Type: 0x%02X (%s)\n", message_type, type_name);
++//     } else {
++//         printf("Packet Type: [ERROR] (Packet truncated before type byte)\n");
++//     }
++// }
++
++uint8_t get_mle_packet_type(const uint8_t* payload, size_t len) {
++    return thread_dissector::GetPacketType(payload, len);
++}
++
+ void Core::ProcessRadio(Node &aNode)
+ {
+     Mac::Address dstAddr;
+@@ -153,6 +225,44 @@ void Core::ProcessRadio(Node &aNode)
+ 
+             Radio::Frame rxFrame(aNode.mRadio.mTxFrame);
+ 
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++            // Direction Flags for AFLNet Trace
++            #define DIR_REQUEST  0x00
++            #define DIR_RESPONSE 0x01
++            if (AllNodesMalicious_g) {
++                uint8_t type = get_mle_packet_type(rxFrame.mPsduBuffer, rxFrame.mLength);
++                write_trace_to_outbox(DIR_REQUEST, type, rxFrame.mPsduBuffer, rxFrame.mLength);
++                rxFrame.mLength = libafl_process(
++                    rxFrame.mPsduBuffer, 
++                    rxFrame.mLength, 
++                    OT_RADIO_FRAME_MAX_SIZE
++                );
++            }
++            else if (aNode.GetId() == MaliciousNodeID_g) { // Let the malicious node mutate the packets
++                // quick_dissect(rxFrame.mPsduBuffer, rxFrame.mLength);
++                // printf("Original Frame: ");
++                // for (int i = 0; i < rxFrame.mLength; i++) {
++                //     printf("%02X ", rxFrame.mPsduBuffer[i]);
++                // }
++                // printf("\n");
++                rxFrame.mLength = libafl_process(
++                    rxFrame.mPsduBuffer, 
++                    rxFrame.mLength, 
++                    OT_RADIO_FRAME_MAX_SIZE
++                );
++                uint8_t type = get_mle_packet_type(rxFrame.mPsduBuffer, rxFrame.mLength);
++                write_trace_to_outbox(DIR_REQUEST, type, rxFrame.mPsduBuffer, rxFrame.mLength);
++                // printf("Fuzzer Frame: ");
++                // for (int i = 0; i < rxFrame.mLength; i++) {
++                //     printf("%02X ", rxFrame.mPsduBuffer[i]);
++                // }
++                // printf("\n");
++            } else if (aNode.GetId() == TargetNodeID_g) {
++                uint8_t type = get_mle_packet_type(rxFrame.mPsduBuffer, rxFrame.mLength);
++                write_trace_to_outbox(DIR_RESPONSE, type, rxFrame.mPsduBuffer, rxFrame.mLength);
++            }
++#endif
++
+             rxFrame.mInfo.mRxInfo.mTimestamp = (mNow.GetValue() * 1000u);
+             rxFrame.mInfo.mRxInfo.mRssi      = kDefaultRxRssi;
+             rxFrame.mInfo.mRxInfo.mLqi       = 0;
+diff --git a/tests/nexus/platform/nexus_misc.cpp b/tests/nexus/platform/nexus_misc.cpp
+index a56ed29fa..463cac9e9 100644
+--- a/tests/nexus/platform/nexus_misc.cpp
++++ b/tests/nexus/platform/nexus_misc.cpp
+@@ -137,11 +137,13 @@ void              otPlatWakeHost(void) {}
+ 
+ void Log(const char *aFormat, ...)
+ {
++#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+     va_list args;
+ 
+     va_start(args, aFormat);
+     LogVarArgs(nullptr, aFormat, args);
+     va_end(args);
++#endif
+ }
+ 
+ static void LogVarArgs(Node *aActiveNode, const char *aFormat, va_list aArgs)
+diff --git a/tests/nexus/platform/thread_dissector.hpp b/tests/nexus/platform/thread_dissector.hpp
+new file mode 100644
+index 000000000..fc2a710b6
+--- /dev/null
++++ b/tests/nexus/platform/thread_dissector.hpp
+@@ -0,0 +1,363 @@
++// thread_dissector.hpp
++//
++// Drop-in replacement for get_mle_packet_type() in the AFLNet adaptation
++// (tests/nexus/platform/nexus_core.cpp). Instead of returning 0xFF for every
++// frame that is not MLE, it parses the IEEE 802.15.4 / 6LoWPAN / UDP headers and
++// assigns distinct response codes to TMF (CoAP) requests and responses, MAC
++// frames, fragments and other UDP/ICMPv6 traffic.
++//
++// Code space (uint8_t, as expected by write_trace_to_outbox):
++//   0x00-0x3E  MLE command byte (as in the old dissector)
++//   0x3F       MLE with an out-of-range command byte
++//   0x40-0x7E  TMF request,  0x40 + index into kTmfUris
++//   0x7F       TMF request with an unknown URI
++//   0x80-0xBE  TMF response, 0x80 + index of the URI of the matching request
++//   0xBF       TMF response whose request was not seen
++//   0xC0       CoAP empty message (empty ACK / RST)
++//   0xC1       CoAP on a port other than 61631 (e.g. 5683)
++//   0xD0       DNS / mDNS / SRP (ports 53, 5353, 53535)
++//   0xD1       other UDP
++//   0xD8       ICMPv6
++//   0xD9       other IPv6 next header
++//   0xE0-0xE3  802.15.4 frame types other than data (beacon, ack, MAC command)
++//   0xE4       6LoWPAN subsequent fragment (FRAGN)
++//   0xE5       not IPHC (e.g. mutated dispatch byte)
++//   0xFF       truncated / unparsable
++//
++// Assumptions (fuzzing build of the patch): the MAC payload and the MLE payload
++// are not encrypted (see the FUZZING_BUILD_MODE changes in mac_frame.cpp and
++// mle.cpp), so the headers above are readable in the intercepted frame.
++
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++namespace thread_dissector {
++
++// TMF URIs of OpenThread (src/core/thread/uri_paths.cpp). The order defines the
++// codes, so append new entries at the end only. At most 63 entries.
++static const char *const kTmfUris[] = {
++    "a/ae", "a/an", "a/aq", "a/ar", "a/as", "a/sd", "a/yl",            // address / server data
++    "b/ba", "b/bmr", "b/bq",                                         // backbone
++    "c/ab", "c/ag", "c/as", "c/ca", "c/cg", "c/cp", "c/cs", "c/da",  // MeshCoP
++    "c/dc", "c/es", "c/jf", "c/la", "c/lp", "c/pc", "c/pg", "c/pq",
++    "c/ps", "c/rx", "c/tx", "c/ur", "c/ut",
++    "d/da", "d/dg", "d/dq", "d/dr",                                  // diagnostics
++    "n/dn", "n/dr", "n/mr",                                          // DUA / MLR
++};
++static const size_t kNumTmfUris = sizeof(kTmfUris) / sizeof(kTmfUris[0]);
++
++enum : uint8_t {
++    kMleUnknown      = 0x3F,
++    kTmfReqBase      = 0x40,
++    kTmfReqUnknown   = 0x7F,
++    kTmfRspBase      = 0x80,
++    kTmfRspUnmatched = 0xBF,
++    kCoapEmpty       = 0xC0,
++    kCoapOtherPort   = 0xC1,
++    kDns             = 0xD0,
++    kUdpOther        = 0xD1,
++    kIcmp6           = 0xD8,
++    kIpOther         = 0xD9,
++    kMacBeacon       = 0xE0,
++    kMacAck          = 0xE2,
++    kMacCommand      = 0xE3,
++    kFragN           = 0xE4,
++    kNotIphc         = 0xE5,
++    kUnknown         = 0xFF,
++};
++
++static const uint16_t kMlePort = 19788;
++static const uint16_t kTmfPort = 61631;
++
++// Token -> URI table, so that a CoAP response is mapped to the URI of its
++// request. Small ring buffer, call Reset() at the start of every execution
++// (LLVMFuzzerTestOneInput), otherwise stale entries only cause a few
++// mismatches.
++struct TokenEntry {
++    uint8_t len;
++    uint8_t token[8];
++    uint8_t uriIndex;
++};
++static TokenEntry sTokens[32];
++static size_t     sNextToken = 0;
++
++inline void Reset(void)
++{
++    memset(sTokens, 0, sizeof(sTokens));
++    sNextToken = 0;
++}
++
++inline void RememberToken(const uint8_t *aToken, uint8_t aLen, uint8_t aUriIndex)
++{
++    if (aLen == 0 || aLen > 8) return;
++    TokenEntry &e = sTokens[sNextToken++ % (sizeof(sTokens) / sizeof(sTokens[0]))];
++    e.len         = aLen;
++    memcpy(e.token, aToken, aLen);
++    e.uriIndex = aUriIndex;
++}
++
++inline int LookupToken(const uint8_t *aToken, uint8_t aLen)
++{
++    for (const TokenEntry &e : sTokens)
++    {
++        if (e.len != 0 && e.len == aLen && memcmp(e.token, aToken, aLen) == 0) return e.uriIndex;
++    }
++    return -1;
++}
++
++// ---------------------------------------------------------------------------
++// CoAP (RFC 7252) on the TMF port
++// ---------------------------------------------------------------------------
++inline uint8_t ClassifyCoap(const uint8_t *p, size_t len, bool aIsTmfPort)
++{
++    if (len < 4 || (p[0] >> 6) != 1) return kUnknown;
++    if (!aIsTmfPort) return kCoapOtherPort;
++
++    uint8_t tkl  = p[0] & 0x0F;
++    uint8_t code = p[1];
++    if (tkl > 8 || 4 + (size_t)tkl > len) return kUnknown;
++    const uint8_t *token = p + 4;
++
++    if (code == 0) return kCoapEmpty;
++
++    bool isRequest = (code >> 5) == 0; // class 0: 0.01 GET .. 0.04 DELETE
++
++    if (!isRequest)
++    {
++        int idx = LookupToken(token, tkl);
++        if (idx < 0) return kTmfRspUnmatched;
++        return (uint8_t)(kTmfRspBase + idx);
++    }
++
++    // Assemble the Uri-Path (option 11) segments as "a/sd".
++    char   uri[32];
++    size_t uriLen = 0;
++    size_t i      = 4 + tkl;
++    unsigned opt  = 0;
++
++    while (i < len && p[i] != 0xFF)
++    {
++        unsigned delta = p[i] >> 4, olen = p[i] & 0x0F;
++        i++;
++        if (delta == 13) { if (i >= len) break; delta = 13 + p[i++]; }
++        else if (delta == 14) { if (i + 1 >= len) break; delta = 269 + ((p[i] << 8) | p[i + 1]); i += 2; }
++        else if (delta == 15) break;
++        if (olen == 13) { if (i >= len) break; olen = 13 + p[i++]; }
++        else if (olen == 14) { if (i + 1 >= len) break; olen = 269 + ((p[i] << 8) | p[i + 1]); i += 2; }
++        else if (olen == 15) break;
++        if (i + olen > len) break;
++
++        opt += delta;
++        if (opt == 11) // Uri-Path
++        {
++            if (uriLen != 0 && uriLen < sizeof(uri) - 1) uri[uriLen++] = '/';
++            for (unsigned k = 0; k < olen && uriLen < sizeof(uri) - 1; k++) uri[uriLen++] = (char)p[i + k];
++        }
++        else if (opt > 11) break; // options are ordered, Uri-Path is done
++        i += olen;
++    }
++    uri[uriLen] = '\0';
++
++    for (size_t u = 0; u < kNumTmfUris && u < 63; u++)
++    {
++        if (strcmp(uri, kTmfUris[u]) == 0)
++        {
++            RememberToken(token, tkl, (uint8_t)u);
++            return (uint8_t)(kTmfReqBase + u);
++        }
++    }
++    return kTmfReqUnknown;
++}
++
++// ---------------------------------------------------------------------------
++// MLE (Thread spec, UDP 19788)
++// ---------------------------------------------------------------------------
++inline uint8_t ClassifyMle(const uint8_t *p, size_t len)
++{
++    if (len < 1) return kUnknown;
++    size_t i = 0;
++    if (p[0] == 0xFF) // unsecured (Discovery Request / Response)
++    {
++        i = 1;
++    }
++    else if (p[0] == 0x00) // secured: aux security header follows
++    {
++        if (len < 2) return kUnknown;
++        uint8_t sc = p[1];
++        i          = 2;
++        if (!((sc >> 5) & 1)) i += 4; // frame counter (not suppressed)
++        static const size_t kKeyIdLen[4] = {0, 1, 5, 9};
++        i += kKeyIdLen[(sc >> 3) & 3];
++    }
++    else
++    {
++        return kUnknown;
++    }
++    if (i >= len) return kUnknown;
++    // MLE commands are below 0x20. Mutated, out-of-range values share one code
++    // instead of aliasing onto real commands.
++    if (p[i] >= 0x3F) return kMleUnknown;
++    return p[i];
++}
++
++inline uint8_t ClassifyUdp(uint16_t aSrc, uint16_t aDst, const uint8_t *aPayload, size_t aLen)
++{
++    if (aSrc == kMlePort || aDst == kMlePort) return ClassifyMle(aPayload, aLen);
++    if (aSrc == kTmfPort || aDst == kTmfPort) return ClassifyCoap(aPayload, aLen, true);
++    if (aSrc == 5683 || aDst == 5683) return ClassifyCoap(aPayload, aLen, false);
++    if (aSrc == 53 || aDst == 53 || aSrc == 5353 || aDst == 5353 || aSrc == 53535 || aDst == 53535) return kDns;
++    return kUdpOther;
++}
++
++// ---------------------------------------------------------------------------
++// IEEE 802.15.4 + 6LoWPAN (RFC 4944 / 6282)
++// ---------------------------------------------------------------------------
++inline uint8_t GetPacketType(const uint8_t *p, size_t len)
++{
++    if (p == nullptr || len < 3) return kUnknown;
++
++#define NEED(n)                      \
++    do                               \
++    {                                \
++        if (i + (n) > len) return kUnknown; \
++    } while (0)
++
++    uint16_t fcf     = (uint16_t)(p[0] | (p[1] << 8));
++    uint8_t  ftype   = fcf & 7;
++    bool     sec     = (fcf >> 3) & 1;
++    bool     panComp = (fcf >> 6) & 1;
++    uint8_t  dstMode = (fcf >> 10) & 3;
++    uint8_t  srcMode = (fcf >> 14) & 3;
++
++    switch (ftype)
++    {
++    case 0: return kMacBeacon;
++    case 1: break;
++    case 2: return kMacAck;
++    case 3: return kMacCommand;
++    default: return kUnknown;
++    }
++
++    static const size_t kAddrLen[4] = {0, 0, 2, 8};
++    size_t              i           = 3; // FCF + sequence number
++    if (dstMode) i += 2 + kAddrLen[dstMode];
++    if (srcMode)
++    {
++        if (!panComp) i += 2;
++        i += kAddrLen[srcMode];
++    }
++    if (sec)
++    {
++        NEED(1);
++        uint8_t sc = p[i++];
++        if (!((sc >> 5) & 1)) i += 4;
++        static const size_t kKeyIdLen[4] = {0, 1, 5, 9};
++        i += kKeyIdLen[(sc >> 3) & 3];
++    }
++
++    // Note: the MIC / FCS at the end of the frame is not stripped. This only
++    // matters for payload lengths, which are not used beyond bounds checks.
++
++    NEED(1);
++    uint8_t d = p[i];
++    if ((d >> 6) == 2) // mesh header
++    {
++        bool v = (d >> 5) & 1, f = (d >> 4) & 1;
++        i += 1 + (v ? 2 : 8) + (f ? 2 : 8);
++        NEED(1);
++        d = p[i];
++    }
++    if ((d >> 3) == 0x18) // FRAG1: headers follow
++    {
++        i += 4;
++        NEED(1);
++        d = p[i];
++    }
++    else if ((d >> 3) == 0x1C) // FRAGN: no headers
++    {
++        return kFragN;
++    }
++    if ((d >> 5) != 0x3) return kNotIphc;
++
++    NEED(2);
++    uint8_t b0 = p[i], b1 = p[i + 1];
++    i += 2;
++    uint8_t tf = (b0 >> 3) & 3, hlim = b0 & 3;
++    bool    nh  = (b0 >> 2) & 1;
++    bool    cid = (b1 >> 7) & 1, sac = (b1 >> 6) & 1, m = (b1 >> 3) & 1, dac = (b1 >> 2) & 1;
++    uint8_t sam = (b1 >> 4) & 3, dam = b1 & 3;
++
++    static const size_t kTf[4]       = {4, 3, 1, 0};
++    static const size_t kAddrU[4]    = {16, 8, 2, 0};   // stateless
++    static const size_t kAddrC[4]    = {0, 8, 2, 0};    // context based
++    static const size_t kMcastU[4]   = {16, 6, 4, 1};   // multicast stateless
++    static const size_t kMcastC[4]   = {6, 0, 0, 0};    // multicast context based
++
++    if (cid) i += 1;
++    i += kTf[tf];
++    uint8_t nextHeader = 0;
++    if (!nh)
++    {
++        NEED(1);
++        nextHeader = p[i++];
++    }
++    if (hlim == 0) i += 1;
++    i += sac ? kAddrC[sam] : kAddrU[sam];
++    if (!m) i += dac ? kAddrC[dam] : kAddrU[dam];
++    else i += dac ? kMcastC[dam] : kMcastU[dam];
++
++    uint16_t src = 0, dst = 0;
++
++    if (nh)
++    {
++        NEED(1);
++        uint8_t n = p[i];
++        // IPv6 extension headers compressed with NHC (e.g. hop-by-hop for MPL)
++        while ((n >> 4) == 0xE)
++        {
++            bool nhBit = n & 1;
++            i += 1;
++            if (!nhBit)
++            {
++                NEED(1);
++                nextHeader = p[i++];
++            }
++            NEED(1);
++            i += 1 + p[i];
++            if (!nhBit) goto inline_next_header;
++            NEED(1);
++            n = p[i];
++        }
++        if ((n >> 3) != 0x1E) return kIpOther; // not NHC UDP
++        {
++            uint8_t ports = n & 3;
++            bool    cElided = (n >> 2) & 1;
++            i += 1;
++            switch (ports)
++            {
++            case 0: NEED(4); src = (p[i] << 8) | p[i + 1]; dst = (p[i + 2] << 8) | p[i + 3]; i += 4; break;
++            case 1: NEED(3); src = (p[i] << 8) | p[i + 1]; dst = 0xF000 | p[i + 2]; i += 3; break;
++            case 2: NEED(3); src = 0xF000 | p[i]; dst = (p[i + 1] << 8) | p[i + 2]; i += 3; break;
++            default: NEED(1); src = 0xF0B0 | (p[i] >> 4); dst = 0xF0B0 | (p[i] & 0xF); i += 1; break;
++            }
++            if (!cElided) i += 2;
++            if (i > len) return kUnknown;
++            return ClassifyUdp(src, dst, p + i, len - i);
++        }
++    }
++
++inline_next_header:
++    if (nextHeader == 58) return kIcmp6;
++    if (nextHeader != 17) return kIpOther;
++    NEED(8); // uncompressed UDP header
++    src = (p[i] << 8) | p[i + 1];
++    dst = (p[i + 2] << 8) | p[i + 3];
++    i += 8;
++    return ClassifyUdp(src, dst, p + i, len - i);
++
++#undef NEED
++}
++
++} // namespace thread_dissector
+\ No newline at end of file

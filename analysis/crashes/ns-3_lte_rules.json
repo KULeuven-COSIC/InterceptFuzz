@@ -1,0 +1,14 @@
+{
+  "No Crash": "Execution successful",
+  "Crash 1": "src/lte/model/lte-ue-mac.cc, line=455",
+  "Crash 2": "src/lte/model/lte-asn1-header.cc, line=357",
+  "Crash 3": "src/lte/model/lte-enb-rrc.cc, line=1278",
+  "Crash 4": "src/lte/model/lte-spectrum-phy.cc, line=1291",
+  "Crash 5": "src/lte/model/lte-ue-rrc.cc, line=1482",
+  "Crash 6": "src/lte/model/lte-ue-rrc.cc, line=1443",
+  "Crash 7": "src/lte/model/lte-ue-rrc.cc, line=1618",
+  "Crash 8": "src/lte/model/lte-ue-rrc.cc, line=1527",
+  "Crash 9": "src/network/model/buffer.h, line=1071",
+  "Crash 10": "src/lte/model/simple-ue-component-carrier-manager.cc, line=300",
+  "Crash 11": "src/lte/model/lte-ue-mac.cc, line=573"
+}

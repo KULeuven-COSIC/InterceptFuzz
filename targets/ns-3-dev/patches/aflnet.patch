@@ -1,0 +1,1098 @@
+diff --git a/fuzz/minimal_lte_fuzz.cc b/fuzz/minimal_lte_fuzz.cc
+new file mode 100644
+index 000000000..54b9eef03
+--- /dev/null
++++ b/fuzz/minimal_lte_fuzz.cc
+@@ -0,0 +1,196 @@
++#include "ns3/core-module.h"
++#include "ns3/network-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/mobility-module.h"
++#include "ns3/lte-module.h"
++#include "ns3/point-to-point-module.h"
++#include <iostream>
++
++#include <sys/shm.h>
++#include "fuzz_parser_configuration.h"
++
++using namespace ns3;
++
++extern std::vector<std::vector<uint8_t>> g_input_queue;
++extern size_t g_input_index;
++extern uint8_t* g_outbox_ptr;
++
++void setup_outbox() {
++    if (g_outbox_ptr != nullptr) return; 
++
++    const char* shm_id_str = getenv("OUTBOX_SHMEM_ID");
++    if (shm_id_str) {
++        int shm_id = atoi(shm_id_str);
++        g_outbox_ptr = (uint8_t*)shmat(shm_id, NULL, 0);
++    }
++}
++
++// =========================================================================
++// TRACE CALLBACKS (Stop simulation immediately on attach outcome)
++// =========================================================================
++
++void NotifyConnectionEstablished(uint64_t imsi, uint16_t cellId, uint16_t rnti)
++{
++    std::cout << "\n======================================================\n";
++    std::cout << "[UE IMSI: " << imsi << "] Attach Procedure Complete!\n";
++    std::cout << "RRC Connection Established at: " << Simulator::Now().GetMilliSeconds() << " ms\n";
++    std::cout << "Halting simulation to prevent further traffic.\n";
++    std::cout << "======================================================\n\n";
++    
++    // Instantly halts the simulation clock
++    Simulator::Stop(); 
++}
++
++void NotifyConnectionTimeout(uint64_t imsi, uint16_t cellId, uint16_t rnti, uint8_t connEstFailCount)
++{
++    std::cout << "\n======================================================\n";
++    std::cout << "[UE IMSI: " << imsi << "] Attach FAILED! (Timeout / Max Retries reached)\n";
++    std::cout << "Failed at: " << Simulator::Now().GetMilliSeconds() << " ms\n";
++    std::cout << "Halting simulation early.\n";
++    std::cout << "======================================================\n\n";
++    
++    // Instantly halts the simulation clock
++    Simulator::Stop(); 
++}
++
++// =========================================================================
++// MAIN SIMULATION
++// =========================================================================
++// extern bool malicious_enb_g;
++// extern bool malicious_ue_g;
++
++int test_lte_attach()
++{
++    // CommandLine cmd(__FILE__);
++    // cmd.Parse(argc, argv);
++
++    // 1. Create nodes: one UE (Phone) and one eNodeB (Base Station)
++    NodeContainer ueNodes;
++    ueNodes.Create(1);
++
++    NodeContainer enbNodes;
++    enbNodes.Create(1);
++
++// #if defined(MALICIOUS_ENB)
++//     malicious_enb_g = true;
++// #elif defined(MALICIOUS_UE)
++//     malicious_ue_g = true;
++// #else
++// #error "You must define either MALICIOUS_ENB or MALICIOUS_UE during compilation"
++// #endif
++
++    // 2. Set up the LTE and EPC (Core Network) helpers
++    Ptr<LteHelper> lteHelper = CreateObject<LteHelper>();
++    lteHelper->SetAttribute("UseIdealRrc", BooleanValue(false));
++    Ptr<PointToPointEpcHelper> epcHelper = CreateObject<PointToPointEpcHelper>();
++    lteHelper->SetEpcHelper(epcHelper);
++
++    // 3. Set physical positions
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    mobility.Install(enbNodes);
++    mobility.Install(ueNodes);
++
++    // 4. Install LTE radio devices
++    NetDeviceContainer enbLteDevs = lteHelper->InstallEnbDevice(enbNodes);
++    NetDeviceContainer ueLteDevs = lteHelper->InstallUeDevice(ueNodes);
++
++    // 5. Install the Internet stack on the UE 
++    InternetStackHelper internet;
++    internet.Install(ueNodes);
++
++    // 6. Assign IP addresses and routing
++    Ipv4InterfaceContainer ueIpIface = epcHelper->AssignUeIpv4Address(NetDeviceContainer(ueLteDevs));
++    
++    Ipv4StaticRoutingHelper ipv4RoutingHelper;
++    // FIXED: Removed the ->GetRoutingProtocol() call
++    Ptr<Ipv4StaticRouting> ueStaticRouting = ipv4RoutingHelper.GetStaticRouting(ueNodes.Get(0)->GetObject<Ipv4>());
++    ueStaticRouting->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
++
++    // 7. Hook our custom callbacks into the UE's RRC state machine
++    Config::ConnectWithoutContext(
++        "/NodeList/*/DeviceList/*/$ns3::LteUeNetDevice/LteUeRrc/ConnectionEstablished",
++        MakeCallback(&NotifyConnectionEstablished)
++    );
++
++    Config::ConnectWithoutContext(
++        "/NodeList/*/DeviceList/*/$ns3::LteUeNetDevice/LteUeRrc/ConnectionTimeout",
++        MakeCallback(&NotifyConnectionTimeout)
++    );
++
++    // 8. Initiate the Attach Procedure
++    lteHelper->Attach(ueLteDevs, enbLteDevs.Get(0));
++
++    // 9. Fail-safe timeout (In case the state machine hangs elsewhere, cap it at 1 second)
++    Simulator::Stop(MilliSeconds(500));
++    
++    Simulator::Run();
++    Simulator::Destroy();
++
++    return 0;
++}
++
++extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
++    setup_outbox();
++    return 0;
++}
++
++extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
++{
++    srand(0U);
++
++    // CRITICAL: Reset the Outbox at the start of every single run!
++    if (g_outbox_ptr != nullptr) {
++        *((uint32_t*)g_outbox_ptr) = 0; 
++    }
++
++    g_input_queue.clear();
++    g_input_index = 0;
++
++    size_t cursor = 0;
++
++    // 1. Process the total length prefix (if enabled)
++    if constexpr (HAS_TOTAL_LEN_PREFIX) {
++        if (size < sizeof(TotalLenType)) {
++            return 0; // Payload too small to even contain the total length header
++        }
++        
++        TotalLenType expected_len = read_len<TotalLenType>(data);
++        size_t expected_size = static_cast<size_t>(expected_len) + sizeof(TotalLenType);
++        if (size != expected_size) {
++            std::cerr << "SIZE MISMATCH! Expected: " << expected_size << "; Got " << size << "" << std::endl;
++            return -1;
++        }
++        cursor += sizeof(TotalLenType);
++    }
++
++    // 2. Parse individual packets
++    while (cursor + sizeof(PktLenType) <= size) {
++        PktLenType len = read_len<PktLenType>(&data[cursor]);
++        cursor += sizeof(PktLenType);
++
++        if (cursor + len <= size) {
++            // Ignore 0-byte payloads
++            if (len > 0) {
++                // emplace_back is slightly more efficient than push_back here
++                g_input_queue.emplace_back(
++                    data + cursor, 
++                    data + cursor + len
++                );
++            }
++            cursor += len;
++        } else {
++            break; // Truncated/corrupted payload, stop parsing safely
++        }
++    }
++    // are identical for every execution path.
++    ns3::RngSeedManager::SetSeed(12345);
++    ns3::RngSeedManager::SetRun(1);
++
++    // 2. Disable unnecessary console logging (optional, but speeds up fuzzing)
++    ns3::LogComponentDisableAll(ns3::LOG_LEVEL_ALL);
++
++    test_lte_attach();
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/fuzz/minimal_wifi_fuzz.cc b/fuzz/minimal_wifi_fuzz.cc
+new file mode 100644
+index 000000000..8dec185bd
+--- /dev/null
++++ b/fuzz/minimal_wifi_fuzz.cc
+@@ -0,0 +1,153 @@
++#include "ns3/core-module.h"
++#include "ns3/network-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/mobility-module.h"
++#include "ns3/wifi-module.h"
++
++#include <sys/shm.h>
++#include <vector>
++#include "fuzz_parser_configuration.h"
++using namespace ns3;
++
++extern std::vector<std::vector<uint8_t>> g_input_queue;
++extern size_t g_input_index;
++extern uint8_t* g_outbox_ptr;
++extern uint32_t sta_id_g;
++extern uint32_t ap_id_g;
++
++void setup_outbox() {
++    if (g_outbox_ptr != nullptr) return; 
++
++    const char* shm_id_str = getenv("OUTBOX_SHMEM_ID");
++    if (shm_id_str) {
++        int shm_id = atoi(shm_id_str);
++        g_outbox_ptr = (uint8_t*)shmat(shm_id, NULL, 0);
++    }
++}
++
++int test_wifi_attach()
++{
++    // CommandLine cmd(__FILE__);
++    // cmd.Parse(argc, argv);
++    // 1. Create exactly two nodes
++    NodeContainer wifiStaNode;
++    wifiStaNode.Create(1);
++    NodeContainer wifiApNode;
++    wifiApNode.Create(1);
++
++    sta_id_g = wifiStaNode.Get(0)->GetId();
++    ap_id_g = wifiApNode.Get(0)->GetId();
++
++    // 2. Set up the physical Wi-Fi channel
++    YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
++    YansWifiPhyHelper phy;
++    phy.SetChannel(channel.Create());
++
++    // 3. Configure the MAC layer and SSID
++    WifiHelper wifi;
++    WifiMacHelper mac;
++    Ssid ssid = Ssid("fuzz-target");
++
++    // Configure the Station (Client)
++    mac.SetType("ns3::StaWifiMac",
++                "Ssid", SsidValue(ssid),
++                "ActiveProbing", BooleanValue(true)); // Forces Probe Requests
++    NetDeviceContainer staDevice = wifi.Install(phy, mac, wifiStaNode);
++
++    // Configure the Access Point (Router)
++    mac.SetType("ns3::ApWifiMac",
++                "Ssid", SsidValue(ssid));
++    NetDeviceContainer apDevice = wifi.Install(phy, mac, wifiApNode);
++
++    // 4. Set physical positions (Wi-Fi requires this to calculate signal strength)
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    mobility.Install(wifiApNode);
++    mobility.Install(wifiStaNode);
++
++    // 5. Install the Internet stack (IP addresses)
++    InternetStackHelper stack;
++    stack.Install(wifiApNode);
++    stack.Install(wifiStaNode);
++
++    Ipv4AddressHelper address;
++    address.SetBase("192.168.1.0", "255.255.255.0");
++    address.Assign(apDevice);
++    address.Assign(staDevice);
++
++    // 6. Enable PCAP tracing directly on the Access Point
++    // phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
++    // phy.EnablePcap("minimal-wifi-attach", apDevice.Get(0));
++
++    // 7. Run for just X ms.
++    Simulator::Stop(MilliSeconds(300));
++    Simulator::Run();
++    Simulator::Destroy();
++
++    return 0;
++}
++
++extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
++    setup_outbox();
++    return 0;
++}
++
++extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
++{
++    srand(0U);
++
++    // CRITICAL: Reset the Outbox at the start of every single run!
++    if (g_outbox_ptr != nullptr) {
++        *((uint32_t*)g_outbox_ptr) = 0; 
++    }
++
++    g_input_queue.clear();
++    g_input_index = 0;
++
++    size_t cursor = 0;
++
++    // 1. Process the total length prefix (if enabled)
++    if constexpr (HAS_TOTAL_LEN_PREFIX) {
++        if (size < sizeof(TotalLenType)) {
++            return 0; // Payload too small to even contain the total length header
++        }
++        
++        TotalLenType expected_len = read_len<TotalLenType>(data);
++        size_t expected_size = static_cast<size_t>(expected_len) + sizeof(TotalLenType);
++        if (size != expected_size) {
++            std::cerr << "SIZE MISMATCH! Expected: " << expected_size << "; Got " << size << "" << std::endl;
++            return -1;
++        }
++        cursor += sizeof(TotalLenType);
++    }
++
++    // 2. Parse individual packets
++    while (cursor + sizeof(PktLenType) <= size) {
++        PktLenType len = read_len<PktLenType>(&data[cursor]);
++        cursor += sizeof(PktLenType);
++
++        if (cursor + len <= size) {
++            // Ignore 0-byte payloads
++            if (len > 0) {
++                // emplace_back is slightly more efficient than push_back here
++                g_input_queue.emplace_back(
++                    data + cursor, 
++                    data + cursor + len
++                );
++            }
++            cursor += len;
++        } else {
++            break; // Truncated/corrupted payload, stop parsing safely
++        }
++    }
++    // are identical for every execution path.
++    ns3::RngSeedManager::SetSeed(12345);
++    ns3::RngSeedManager::SetRun(1);
++
++    // 2. Disable unnecessary console logging (optional, but speeds up fuzzing)
++    ns3::LogComponentDisableAll(ns3::LOG_LEVEL_ALL);
++
++    test_wifi_attach();
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/scratch/.gitignore b/scratch/.gitignore
+index 64892bfaf..50d1bab82 100644
+--- a/scratch/.gitignore
++++ b/scratch/.gitignore
+@@ -2,6 +2,7 @@
+ /*
+ !.gitignore
+ 
++!fuzz/
+ !nested-subdir/
+ !subdir/
+ !scratch-simulator.cc
+diff --git a/scratch/fuzz/CMakeLists.txt b/scratch/fuzz/CMakeLists.txt
+new file mode 100644
+index 000000000..88a8d4bc3
+--- /dev/null
++++ b/scratch/fuzz/CMakeLists.txt
+@@ -0,0 +1,12 @@
++add_compile_options(-fsanitize=fuzzer)
++add_link_options(-fsanitize=fuzzer)
++
++build_exec(
++  EXECNAME
++  target
++  SOURCE_FILES
++  target.cc
++  LIBRARIES_TO_LINK
++  "${ns3-libs}"
++  EXECUTABLE_DIRECTORY_PATH
++  ${CMAKE_OUTPUT_DIRECTORY}/scratch/fuzz)
+diff --git a/scratch/fuzz/fuzz_parser_configuration.h b/scratch/fuzz/fuzz_parser_configuration.h
+new file mode 100644
+index 000000000..836fb7408
+--- /dev/null
++++ b/scratch/fuzz/fuzz_parser_configuration.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <iostream>
++#include <vector>
++#include <cstdint>
++
++enum class Endian { Big, Little };
++
++// Toggle whether the payload includes a total length prefix at the very beginning
++constexpr bool HAS_TOTAL_LEN_PREFIX = true;
++
++// Define the byte-sizes by setting the underlying integer types.
++// Change to uint16_t (2 bytes), uint8_t (1 byte), or uint64_t (8 bytes) as needed.
++using TotalLenType = uint32_t; 
++using PktLenType   = uint32_t; 
++
++// Set the endianness of the incoming fuzzer payload
++constexpr Endian ENCODING = Endian::Big;
++
++// =========================================================================
++// TEMPLATED READER FUNCTION
++// =========================================================================
++// This single function automatically adapts to the byte-size of the type (T) 
++// and the chosen endianness without any runtime overhead.
++template <typename T, Endian E = ENCODING>
++inline T read_len(const uint8_t* buf) {
++    T result = 0;
++    if constexpr (E == Endian::Big) {
++        for (size_t i = 0; i < sizeof(T); ++i) {
++            result = (result << 8) | buf[i];
++        }
++    } else {
++        for (size_t i = 0; i < sizeof(T); ++i) {
++            result |= (static_cast<T>(buf[i]) << (i * 8));
++        }
++    }
++    return result;
++}
+\ No newline at end of file
+diff --git a/scratch/fuzz/target.cc b/scratch/fuzz/target.cc
+new file mode 100644
+index 000000000..8dec185bd
+--- /dev/null
++++ b/scratch/fuzz/target.cc
+@@ -0,0 +1,153 @@
++#include "ns3/core-module.h"
++#include "ns3/network-module.h"
++#include "ns3/internet-module.h"
++#include "ns3/mobility-module.h"
++#include "ns3/wifi-module.h"
++
++#include <sys/shm.h>
++#include <vector>
++#include "fuzz_parser_configuration.h"
++using namespace ns3;
++
++extern std::vector<std::vector<uint8_t>> g_input_queue;
++extern size_t g_input_index;
++extern uint8_t* g_outbox_ptr;
++extern uint32_t sta_id_g;
++extern uint32_t ap_id_g;
++
++void setup_outbox() {
++    if (g_outbox_ptr != nullptr) return; 
++
++    const char* shm_id_str = getenv("OUTBOX_SHMEM_ID");
++    if (shm_id_str) {
++        int shm_id = atoi(shm_id_str);
++        g_outbox_ptr = (uint8_t*)shmat(shm_id, NULL, 0);
++    }
++}
++
++int test_wifi_attach()
++{
++    // CommandLine cmd(__FILE__);
++    // cmd.Parse(argc, argv);
++    // 1. Create exactly two nodes
++    NodeContainer wifiStaNode;
++    wifiStaNode.Create(1);
++    NodeContainer wifiApNode;
++    wifiApNode.Create(1);
++
++    sta_id_g = wifiStaNode.Get(0)->GetId();
++    ap_id_g = wifiApNode.Get(0)->GetId();
++
++    // 2. Set up the physical Wi-Fi channel
++    YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
++    YansWifiPhyHelper phy;
++    phy.SetChannel(channel.Create());
++
++    // 3. Configure the MAC layer and SSID
++    WifiHelper wifi;
++    WifiMacHelper mac;
++    Ssid ssid = Ssid("fuzz-target");
++
++    // Configure the Station (Client)
++    mac.SetType("ns3::StaWifiMac",
++                "Ssid", SsidValue(ssid),
++                "ActiveProbing", BooleanValue(true)); // Forces Probe Requests
++    NetDeviceContainer staDevice = wifi.Install(phy, mac, wifiStaNode);
++
++    // Configure the Access Point (Router)
++    mac.SetType("ns3::ApWifiMac",
++                "Ssid", SsidValue(ssid));
++    NetDeviceContainer apDevice = wifi.Install(phy, mac, wifiApNode);
++
++    // 4. Set physical positions (Wi-Fi requires this to calculate signal strength)
++    MobilityHelper mobility;
++    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
++    mobility.Install(wifiApNode);
++    mobility.Install(wifiStaNode);
++
++    // 5. Install the Internet stack (IP addresses)
++    InternetStackHelper stack;
++    stack.Install(wifiApNode);
++    stack.Install(wifiStaNode);
++
++    Ipv4AddressHelper address;
++    address.SetBase("192.168.1.0", "255.255.255.0");
++    address.Assign(apDevice);
++    address.Assign(staDevice);
++
++    // 6. Enable PCAP tracing directly on the Access Point
++    // phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
++    // phy.EnablePcap("minimal-wifi-attach", apDevice.Get(0));
++
++    // 7. Run for just X ms.
++    Simulator::Stop(MilliSeconds(300));
++    Simulator::Run();
++    Simulator::Destroy();
++
++    return 0;
++}
++
++extern "C" int LLVMFuzzerInitialize(int *argc, char ***argv) {
++    setup_outbox();
++    return 0;
++}
++
++extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
++{
++    srand(0U);
++
++    // CRITICAL: Reset the Outbox at the start of every single run!
++    if (g_outbox_ptr != nullptr) {
++        *((uint32_t*)g_outbox_ptr) = 0; 
++    }
++
++    g_input_queue.clear();
++    g_input_index = 0;
++
++    size_t cursor = 0;
++
++    // 1. Process the total length prefix (if enabled)
++    if constexpr (HAS_TOTAL_LEN_PREFIX) {
++        if (size < sizeof(TotalLenType)) {
++            return 0; // Payload too small to even contain the total length header
++        }
++        
++        TotalLenType expected_len = read_len<TotalLenType>(data);
++        size_t expected_size = static_cast<size_t>(expected_len) + sizeof(TotalLenType);
++        if (size != expected_size) {
++            std::cerr << "SIZE MISMATCH! Expected: " << expected_size << "; Got " << size << "" << std::endl;
++            return -1;
++        }
++        cursor += sizeof(TotalLenType);
++    }
++
++    // 2. Parse individual packets
++    while (cursor + sizeof(PktLenType) <= size) {
++        PktLenType len = read_len<PktLenType>(&data[cursor]);
++        cursor += sizeof(PktLenType);
++
++        if (cursor + len <= size) {
++            // Ignore 0-byte payloads
++            if (len > 0) {
++                // emplace_back is slightly more efficient than push_back here
++                g_input_queue.emplace_back(
++                    data + cursor, 
++                    data + cursor + len
++                );
++            }
++            cursor += len;
++        } else {
++            break; // Truncated/corrupted payload, stop parsing safely
++        }
++    }
++    // are identical for every execution path.
++    ns3::RngSeedManager::SetSeed(12345);
++    ns3::RngSeedManager::SetRun(1);
++
++    // 2. Disable unnecessary console logging (optional, but speeds up fuzzing)
++    ns3::LogComponentDisableAll(ns3::LOG_LEVEL_ALL);
++
++    test_wifi_attach();
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/src/lte/model/lte-rrc-protocol-real.cc b/src/lte/model/lte-rrc-protocol-real.cc
+index 86173a6ef..1e9f61ccb 100644
+--- a/src/lte/model/lte-rrc-protocol-real.cc
++++ b/src/lte/model/lte-rrc-protocol-real.cc
+@@ -22,9 +22,154 @@
+ #include "ns3/nstime.h"
+ #include "ns3/simulator.h"
+ 
++#include <algorithm>
++#include <vector>
++#include <iostream>
++
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++// bool malicious_enb_g = false;
++// bool malicious_ue_g = false;
++
++std::vector<std::vector<uint8_t>> g_input_queue;
++size_t g_input_index = 0;
++uint8_t* g_outbox_ptr = nullptr;
++const size_t OUTBOX_CAPACITY = 1024 * 1024;
++#endif
++
+ namespace ns3
+ {
+ 
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++
++#define DIR_UPLINK  0x00
++#define DIR_DOWNLINK 0x01
++
++enum LteRrcFuzzPacketType : uint8_t {
++    LTE_RRC_CONN_REQ               = 0x01,
++    LTE_RRC_CONN_SETUP             = 0x02,
++    LTE_RRC_CONN_SETUP_COMPLETE    = 0x03,
++    LTE_RRC_CONN_REJECT            = 0x04,
++    LTE_RRC_CONN_RECONF            = 0x05,
++    LTE_RRC_CONN_RECONF_COMPLETE   = 0x06,
++    LTE_RRC_CONN_REEST_REQ         = 0x07,
++    LTE_RRC_CONN_REEST             = 0x08,
++    LTE_RRC_CONN_REEST_COMPLETE    = 0x09,
++    LTE_RRC_CONN_REEST_REJECT      = 0x0A,
++    LTE_RRC_MEAS_REPORT            = 0x0B
++};
++
++size_t process_packet(uint8_t* buf, size_t buf_len, size_t max_len) {
++    if (g_input_index < g_input_queue.size()) {
++        std::cout << "[FUZZING!]" << std::endl;
++        const auto& packet = g_input_queue[g_input_index];
++        size_t copy_len = std::min(packet.size(), max_len);
++        memcpy(buf, packet.data(), copy_len);
++        
++        g_input_index++;
++        return copy_len;
++    } else {
++        std::cout << "[UNCHANGED!]" << std::endl;
++    }
++    return buf_len;
++}
++
++void write_trace_to_outbox(uint8_t direction, uint8_t packet_type, const uint8_t* packet, size_t len) {
++    if (!g_outbox_ptr) {
++        return;
++    }
++
++    uint32_t* total_bytes_ptr = (uint32_t*)g_outbox_ptr;
++    uint32_t current_offset = *total_bytes_ptr;
++
++    // Header size is now 6 bytes: [1b Dir] + [1b Type] + [4b Length]
++    if (4 + current_offset + 6 + len <= OUTBOX_CAPACITY) {
++        uint8_t* write_ptr = g_outbox_ptr + 4 + current_offset;
++        
++        // 1. Write Direction
++        write_ptr[0] = direction;
++        
++        // 2. Write Type
++        write_ptr[1] = packet_type;
++        
++        // 3. Write 4-byte Length in Big-Endian (BE)
++        write_ptr[2] = (uint8_t)((len >> 24) & 0xFF);
++        write_ptr[3] = (uint8_t)((len >> 16) & 0xFF);
++        write_ptr[4] = (uint8_t)((len >> 8) & 0xFF);
++        write_ptr[5] = (uint8_t)(len & 0xFF);
++        
++        // 4. Append the payload
++        if (len > 0 && packet != nullptr) {
++            memcpy(write_ptr + 6, packet, len);
++        }
++        
++        // Update the global total bytes counter
++        *total_bytes_ptr += (6 + len);
++    }
++}
++
++ns3::Ptr<ns3::Packet> MutatePacketWithFuzzer(ns3::Ptr<ns3::Packet> originalPacket, uint32_t max_len)
++{
++    uint32_t payloadSize = originalPacket->GetSize();
++    
++    // 1. Allocate a buffer large enough for both the original packet and potential mutations
++    std::vector<uint8_t> buffer(max_len, 0);
++
++    // 2. Extract the serialized bytes (safely capped to max_len to prevent overflows)
++    uint32_t copySize = std::min(payloadSize, max_len);
++    originalPacket->CopyData(buffer.data(), copySize);
++
++    // 3. Run your interception template
++    uint32_t new_len = process_packet(buffer.data(), copySize, max_len);
++
++    // 4. Return a brand new packet containing the fuzzer's bytes
++    return ns3::Create<ns3::Packet>(buffer.data(), new_len);
++}
++
++// ns3::Ptr<ns3::Packet> ProcessFuzzerTx(ns3::Ptr<ns3::Packet> packet, int DIRECTION, uint8_t packet_type, uint32_t max_len)
++// {
++//     if (is_malicious) {
++//         // 1. Mutate the packet
++//         packet = MutatePacketWithFuzzer(packet, max_len);
++        
++//         // 2. Extract the NEW fuzzed bytes
++//         uint32_t fuzzed_len = packet->GetSize();
++//         std::vector<uint8_t> fuzzed_buf(fuzzed_len);
++//         packet->CopyData(fuzzed_buf.data(), fuzzed_len);
++        
++//         // 3. Write to outbox
++//         write_trace_to_outbox(DIRECTION, packet_type, fuzzed_buf.data(), fuzzed_len);
++//     } else {
++//         // 1. Extract the original clean bytes
++//         uint32_t clean_len = packet->GetSize();
++//         std::vector<uint8_t> clean_buf(clean_len);
++//         packet->CopyData(clean_buf.data(), clean_len);
++        
++//         // 2. Write to outbox
++//         write_trace_to_outbox(DIRECTION, packet_type, clean_buf.data(), clean_len);
++//     }
++    
++//     return packet;
++// }
++
++ns3::Ptr<ns3::Packet> ProcessFuzzerTx(ns3::Ptr<ns3::Packet> packet, uint8_t DIRECTION, uint8_t packet_type, uint32_t max_len)
++{
++    // 1. Mutate the packet
++    packet = MutatePacketWithFuzzer(packet, max_len);
++    
++    // 2. Extract the fuzzed bytes
++    uint32_t fuzzed_len = packet->GetSize();
++    std::vector<uint8_t> fuzzed_buf(fuzzed_len);
++    packet->CopyData(fuzzed_buf.data(), fuzzed_len);
++    
++    // 3. Write to outbox
++    write_trace_to_outbox(DIRECTION, packet_type /* Non-fuzzed packet type. Serves as a feedback for AFLNet */, fuzzed_buf.data(), fuzzed_len);
++    
++    return packet;
++}
++
++#endif // FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++
++
+ NS_LOG_COMPONENT_DEFINE("LteRrcProtocolReal");
+ 
+ /// RRC real message delay
+@@ -109,7 +254,9 @@ LteUeRrcProtocolReal::DoSendRrcConnectionRequest(LteRrcSap::RrcConnectionRequest
+     rrcConnectionRequestHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionRequestHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_UPLINK, LTE_RRC_CONN_REQ, 2048);
++#endif
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = m_rnti;
+@@ -128,7 +275,9 @@ LteUeRrcProtocolReal::DoSendRrcConnectionSetupCompleted(
+     rrcConnectionSetupCompleteHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionSetupCompleteHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_UPLINK, LTE_RRC_CONN_SETUP_COMPLETE, 8192);
++#endif
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = m_rnti;
+@@ -155,7 +304,9 @@ LteUeRrcProtocolReal::DoSendRrcConnectionReconfigurationCompleted(
+     rrcConnectionReconfigurationCompleteHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReconfigurationCompleteHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_UPLINK, LTE_RRC_CONN_RECONF_COMPLETE, 8192);
++#endif
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = m_rnti;
+@@ -178,7 +329,9 @@ LteUeRrcProtocolReal::DoSendMeasurementReport(LteRrcSap::MeasurementReport msg)
+     measurementReportHeader.SetMessage(msg);
+ 
+     packet->AddHeader(measurementReportHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_UPLINK, LTE_RRC_MEAS_REPORT, 8192);
++#endif
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = m_rnti;
+@@ -219,7 +372,9 @@ LteUeRrcProtocolReal::DoSendRrcConnectionReestablishmentRequest(
+     rrcConnectionReestablishmentRequestHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentRequestHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_UPLINK, LTE_RRC_CONN_REEST_REQ, 2048);
++#endif
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = m_rnti;
+@@ -238,6 +393,9 @@ LteUeRrcProtocolReal::DoSendRrcConnectionReestablishmentComplete(
+     rrcConnectionReestablishmentCompleteHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentCompleteHeader);
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_UPLINK, LTE_RRC_CONN_REEST_COMPLETE, 2048);
++#endif
+ 
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+@@ -451,35 +609,6 @@ LteEnbRrcProtocolReal::DoSetupUe(uint16_t rnti, LteEnbRrcSapUser::SetupUeParamet
+ {
+     NS_LOG_FUNCTION(this << rnti);
+ 
+-    // // walk list of all nodes to get the peer UE RRC SAP Provider
+-    // Ptr<LteUeRrc> ueRrc;
+-    // NodeList::Iterator listEnd = NodeList::End ();
+-    // bool found = false;
+-    // for (NodeList::Iterator i = NodeList::Begin (); (i != listEnd) && (found == false); i++)
+-    //   {
+-    //     Ptr<Node> node = *i;
+-    //     int nDevs = node->GetNDevices ();
+-    //     for (int j = 0; j < nDevs; j++)
+-    //       {
+-    //         Ptr<LteUeNetDevice> ueDev = node->GetDevice (j)->GetObject <LteUeNetDevice> ();
+-    //         if (!ueDev)
+-    //           {
+-    //             continue;
+-    //           }
+-    //         else
+-    //           {
+-    //             ueRrc = ueDev->GetRrc ();
+-    //             if ((ueRrc->GetRnti () == rnti) && (ueRrc->GetCellId () == m_cellId))
+-    //               {
+-    //              found = true;
+-    //              break;
+-    //               }
+-    //           }
+-    //       }
+-    //   }
+-    // NS_ASSERT_MSG (found , " Unable to find UE with RNTI=" << rnti << " cellId=" << m_cellId);
+-    // m_enbRrcSapProviderMap[rnti] = ueRrc->GetLteUeRrcSapProvider ();
+-
+     // just create empty entry, the UeRrcSapProvider will be set by the
+     // ue upon connection request or connection reconfiguration
+     // completed
+@@ -563,7 +692,9 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionSetup(uint16_t rnti, LteRrcSap::RrcCon
+     rrcConnectionSetupHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionSetupHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_DOWNLINK, LTE_RRC_CONN_SETUP, 2048);
++#endif
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+@@ -581,7 +712,9 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReject(uint16_t rnti, LteRrcSap::RrcCo
+     rrcConnectionRejectHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionRejectHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_DOWNLINK, LTE_RRC_CONN_REJECT, 2048);
++#endif
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+@@ -601,7 +734,9 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReconfiguration(
+     rrcConnectionReconfigurationHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReconfigurationHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_DOWNLINK, LTE_RRC_CONN_RECONF, 8192);
++#endif
+     LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+     transmitPdcpSduParameters.pdcpSdu = packet;
+     transmitPdcpSduParameters.rnti = rnti;
+@@ -621,7 +756,9 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReestablishment(
+     rrcConnectionReestablishmentHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_DOWNLINK, LTE_RRC_CONN_REEST, 2048);
++#endif
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+@@ -641,7 +778,9 @@ LteEnbRrcProtocolReal::DoSendRrcConnectionReestablishmentReject(
+     rrcConnectionReestablishmentRejectHeader.SetMessage(msg);
+ 
+     packet->AddHeader(rrcConnectionReestablishmentRejectHeader);
+-
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    packet = ProcessFuzzerTx(packet, DIR_DOWNLINK, LTE_RRC_CONN_REEST_REJECT, 2048);
++#endif
+     LteRlcSapProvider::TransmitPdcpPduParameters transmitPdcpPduParameters;
+     transmitPdcpPduParameters.pdcpPdu = packet;
+     transmitPdcpPduParameters.rnti = rnti;
+@@ -654,30 +793,6 @@ void
+ LteEnbRrcProtocolReal::DoSendRrcConnectionRelease(uint16_t rnti,
+                                                   LteRrcSap::RrcConnectionRelease msg)
+ {
+-    // The code below is commented so RRC connection release can be sent in an ideal way
+-    /*
+-    Ptr<Packet> packet = Create<Packet> ();
+-
+-    RrcConnectionReleaseHeader rrcConnectionReleaseHeader;
+-    rrcConnectionReleaseHeader.SetMessage (msg);
+-
+-    packet->AddHeader (rrcConnectionReleaseHeader);
+-
+-    LtePdcpSapProvider::TransmitPdcpSduParameters transmitPdcpSduParameters;
+-    transmitPdcpSduParameters.pdcpSdu = packet;
+-    transmitPdcpSduParameters.rnti = rnti;
+-    transmitPdcpSduParameters.lcid = 1;
+-
+-    m_setupUeParametersMap[rnti].srb1SapProvider->TransmitPdcpSdu (transmitPdcpSduParameters);
+-    */
+-    /**
+-     * Send RRC connection release in an idle way to ensure UE goes
+-     * to idle mode during handover failure and connection setup timeout.
+-     * Implemented to avoid unnecessary triggering of assert msgs due to reception of
+-     * msgs (SRS CQI reports) from UE after UE context is deleted at eNodeB.
+-     * TODO: Detection of handover failure and connection setup timeout at UE,
+-     * so that the RRC connection release can be sent through the physical channel again.
+-     */
+     NS_LOG_FUNCTION(this << rnti);
+     Simulator::Schedule(RRC_REAL_MSG_DELAY,
+                         &LteUeRrcSapProvider::RecvRrcConnectionRelease,
+@@ -827,4 +942,4 @@ RealProtocolRlcSapUser::ReceivePdcpPdu(Ptr<Packet> p)
+     m_pdcp->DoReceivePdcpPdu(m_rnti, p);
+ }
+ 
+-} // namespace ns3
++} // namespace ns3
+\ No newline at end of file
+diff --git a/src/wifi/model/wifi-mac-queue.cc b/src/wifi/model/wifi-mac-queue.cc
+index 64f0e3456..5ff384c5b 100644
+--- a/src/wifi/model/wifi-mac-queue.cc
++++ b/src/wifi/model/wifi-mac-queue.cc
+@@ -18,6 +18,64 @@
+ #include <functional>
+ #include <optional>
+ 
++#define DIR_TO_AP  0x00
++#define DIR_TO_STA 0x01
++
++std::vector<std::vector<uint8_t>> g_input_queue;
++size_t g_input_index = 0;
++uint32_t sta_id_g = 0;
++uint32_t ap_id_g = 1;
++uint8_t* g_outbox_ptr = nullptr;
++const size_t OUTBOX_CAPACITY = 1024 * 1024;
++size_t process_packet(uint8_t* buf, size_t buf_len, size_t max_len) {
++    if (g_input_index < g_input_queue.size()) {
++        std::cout << "[FUZZING!]" << std::endl;
++        const auto& packet = g_input_queue[g_input_index];
++        size_t copy_len = std::min(packet.size(), max_len);
++        memcpy(buf, packet.data(), copy_len);
++        
++        g_input_index++;
++        return copy_len;
++    } else {
++        std::cout << "[UNCHANGED!]" << std::endl;
++    }
++    return buf_len;
++}
++
++void write_trace_to_outbox(uint8_t direction, uint8_t packet_type, const uint8_t* packet, size_t len) {
++    if (!g_outbox_ptr) {
++        return;
++    }
++
++    uint32_t* total_bytes_ptr = (uint32_t*)g_outbox_ptr;
++    uint32_t current_offset = *total_bytes_ptr;
++
++    // Header size is now 6 bytes: [1b Dir] + [1b Type] + [4b Length]
++    if (4 + current_offset + 6 + len <= OUTBOX_CAPACITY) {
++        uint8_t* write_ptr = g_outbox_ptr + 4 + current_offset;
++        
++        // 1. Write Direction
++        write_ptr[0] = direction;
++        
++        // 2. Write Type
++        write_ptr[1] = packet_type;
++        
++        // 3. Write 4-byte Length in Big-Endian (BE)
++        write_ptr[2] = (uint8_t)((len >> 24) & 0xFF);
++        write_ptr[3] = (uint8_t)((len >> 16) & 0xFF);
++        write_ptr[4] = (uint8_t)((len >> 8) & 0xFF);
++        write_ptr[5] = (uint8_t)(len & 0xFF);
++        
++        // 4. Append the payload
++        if (len > 0 && packet != nullptr) {
++            memcpy(write_ptr + 6, packet, len);
++        }
++        
++        // Update the global total bytes counter
++        *total_bytes_ptr += (6 + len);
++    }
++}
++
+ namespace ns3
+ {
+ 
+@@ -223,6 +281,77 @@ WifiMacQueue::Enqueue(Ptr<WifiMpdu> item)
+ {
+     NS_LOG_FUNCTION(this << *item);
+ 
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++    const WifiMacHeader& macHeader = item->GetHeader();
++    Ptr<const Packet> payload = item->GetPacket();
++
++    uint32_t senderNodeId = Simulator::GetContext();
++    uint32_t payloadSize = payload->GetSize();
++
++    // 1. Determine the Packet Type for the outbox
++    uint8_t packet_type = 0xFF; // Default: Unknown/Error
++    if (macHeader.IsMgt()) {
++        if (macHeader.IsAssocReq())            packet_type = 0;
++        else if (macHeader.IsAssocResp())      packet_type = 1;
++        else if (macHeader.IsReassocReq())     packet_type = 2;
++        else if (macHeader.IsReassocResp())    packet_type = 3;
++        else if (macHeader.IsProbeReq())       packet_type = 4;
++        else if (macHeader.IsProbeResp())      packet_type = 5;
++        else if (macHeader.IsBeacon())         packet_type = 8;
++        else if (macHeader.IsDisassociation()) packet_type = 10;
++        else if (macHeader.IsAuthentication()) packet_type = 11;
++        else if (macHeader.IsDeauthentication()) packet_type = 12;
++        else if (macHeader.IsAction())         packet_type = 13;
++    } else if (macHeader.IsData()) {
++        packet_type = 100;
++    } else if (macHeader.IsCtl()) {
++        packet_type = 101;
++    }
++
++    // 2. Handle Client Requests (Malicious Node)
++    // if (senderNodeId == malicious_node_id_g && payloadSize > 0)
++    if (payloadSize > 0)
++    {
++        std::cout << "\n[FUZZER] Packet with payload detected! Passing to fuzz()...\n";
++
++        uint32_t max_len = 1500;
++        uint8_t* buffer_ptr = new uint8_t[max_len];
++        payload->CopyData(buffer_ptr, payloadSize);
++
++        // NOTE: If your goal is to save *benign* seeds to the outbox for later fuzzing, 
++        // you should actually write them here BEFORE process_packet() mutates the buffer:
++        // write_trace_to_outbox(DIR_REQUEST, packet_type, buffer_ptr, payloadSize);
++
++        // CALL YOUR FUZZER
++        uint32_t new_len = process_packet(buffer_ptr, payloadSize, max_len);
++        
++        // Write to outbox
++        uint8_t direction = (senderNodeId == sta_id_g) ? DIR_TO_AP : DIR_TO_STA;
++        write_trace_to_outbox(direction, packet_type /* Non-fuzzed packet type. Serves as a feedback for AFLNet */, buffer_ptr, new_len);
++
++        Ptr<Packet> fuzzedPayload = Create<Packet>(buffer_ptr, new_len);
++        Ptr<WifiMpdu> fuzzedItem = Create<WifiMpdu>(fuzzedPayload, macHeader);
++        
++        item = fuzzedItem;
++        delete[] buffer_ptr;
++    } 
++    // // 3. Handle Target Responses (Benign AP Node)
++    // else 
++    // {
++    //     if (payloadSize > 0) {
++    //         // Extract the target's payload bytes to write to the outbox
++    //         uint8_t* resp_buf = new uint8_t[payloadSize];
++    //         payload->CopyData(resp_buf, payloadSize);
++            
++    //         write_trace_to_outbox(DIR_RESPONSE, packet_type, resp_buf, payloadSize);
++            
++    //         delete[] resp_buf;
++    //     } else {
++    //         // Target sent a packet with NO payload (e.g., pure ACK or Control Frame)
++    //         write_trace_to_outbox(DIR_RESPONSE, packet_type, nullptr, 0);
++    //     }
++    // }
++#endif
+     auto queueId = WifiMacQueueContainer::GetQueueId(item);
+     return Insert(GetContainer().GetQueue(queueId).cend(), item);
+ }

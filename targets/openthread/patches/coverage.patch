@@ -1,0 +1,431 @@
+diff --git a/src/core/common/log.hpp b/src/core/common/log.hpp
+index 9819c3d36..e1c58c034 100644
+--- a/src/core/common/log.hpp
++++ b/src/core/common/log.hpp
+@@ -49,7 +49,13 @@ namespace ot {
+  *
+  * This definition indicates whether or not logging is enabled.
+  */
+-#define OT_SHOULD_LOG (OPENTHREAD_CONFIG_LOG_OUTPUT != OPENTHREAD_CONFIG_LOG_OUTPUT_NONE)
++#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
++    // Completely disable logging during fuzzing
++    #define OT_SHOULD_LOG 0
++#else
++    // Normal production logging logic
++    #define OT_SHOULD_LOG (OPENTHREAD_CONFIG_LOG_OUTPUT != OPENTHREAD_CONFIG_LOG_OUTPUT_NONE)
++#endif
+ 
+ /**
+  * Indicates whether the OpenThread logging is enabled at a given log level.
+diff --git a/src/core/mac/mac_frame.cpp b/src/core/mac/mac_frame.cpp
+index 1cafa255e..52446f93a 100644
+--- a/src/core/mac/mac_frame.cpp
++++ b/src/core/mac/mac_frame.cpp
+@@ -1391,7 +1391,11 @@ void TxFrame::ProcessTransmitAesCcm(const ExtAddress &aExtAddress)
+ 
+     aesCcm.Init(GetHeaderLength(), GetPayloadLength(), tagLength, nonce, sizeof(nonce));
+     aesCcm.Header(GetHeader(), GetHeaderLength());
++#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+     aesCcm.Payload(GetPayload(), GetPayload(), GetPayloadLength(), Crypto::AesCcm::kEncrypt);
++#else
++    aesCcm.Payload(GetPayload(), nullptr, GetPayloadLength(), Crypto::AesCcm::kEncrypt);
++#endif
+     aesCcm.Finalize(GetFooter());
+ 
+     SetIsSecurityProcessed(true);
+diff --git a/src/core/thread/mle.cpp b/src/core/thread/mle.cpp
+index fd8656056..96c44754a 100644
+--- a/src/core/thread/mle.cpp
++++ b/src/core/thread/mle.cpp
+@@ -1489,12 +1489,13 @@ Error Mle::ProcessMessageSecurity(Crypto::AesCcm::Mode    aMode,
+     aesCcm.Header(aHeader);
+ 
+ #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+-    if (aMode == Crypto::AesCcm::kDecrypt)
+-    {
+-        // Skip decrypting the message under fuzz build mode
+-        aMessage.RemoveFooter(kMleSecurityTagSize);
+-        ExitNow();
+-    }
++    ExitNow();
++    // if (aMode == Crypto::AesCcm::kDecrypt)
++    // {
++    //     // Skip decrypting the message under fuzz build mode
++    //     aMessage.RemoveFooter(kMleSecurityTagSize);
++    //     ExitNow();
++    // }
+ #endif
+ 
+     aesCcm.Payload(aMessage, aCmdOffset, payloadLength, aMode);
+diff --git a/src/include/common/new.hpp b/src/include/common/new.hpp
+index bb49e3c64..cb3765b86 100644
+--- a/src/include/common/new.hpp
++++ b/src/include/common/new.hpp
+@@ -38,6 +38,7 @@
+ 
+ #include <openthread/platform/toolchain.h>
+ 
+-inline void *operator new(size_t, void *p) throw() { return p; }
++#include <memory>
++//inline void *operator new(size_t, void *p) throw() { return p; }
+ 
+ #endif // OT_INCLUDE_COMMON_NEW_HPP_
+diff --git a/tests/fuzz/CMakeLists.txt b/tests/fuzz/CMakeLists.txt
+index f8cb57939..4f7c353aa 100644
+--- a/tests/fuzz/CMakeLists.txt
++++ b/tests/fuzz/CMakeLists.txt
+@@ -47,6 +47,15 @@ set(COMMON_LIBS
+     ot-config
+ )
+ 
++set(FUZZ_CXX_FLAGS
++	-O0
++    -g
++)
++set(FUZZ_LINK_FLAGS
++    -O0
++    -g
++)
++
+ target_compile_definitions(ot-config INTERFACE "OPENTHREAD_CONFIG_RADIO_LINK_TREL_ENABLE=1")
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+@@ -71,18 +80,22 @@ macro(ot_nexus_test name)
+     target_link_libraries(${name}-fuzzer
+     PRIVATE
+         ${COMMON_LIBS}
++        ${FUZZ_LINK_FLAGS}
+     )
+ 
+     target_compile_options(${name}-fuzzer
+     PRIVATE
+         ${COMMON_COMPILE_OPTIONS}
++        ${FUZZ_CXX_FLAGS}
+     )
+ endmacro()
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+-ot_nexus_test(icmp6)
+-ot_nexus_test(ip6)
+-ot_nexus_test(mdns)
+-ot_nexus_test(radio-one-node)
+-ot_nexus_test(trel)
++# ot_nexus_test(icmp6)
++# ot_nexus_test(ip6)
++# ot_nexus_test(mdns)
++# ot_nexus_test(radio-one-node)
++# ot_nexus_test(trel)
++
++ot_nexus_test(fuzz_test_form_join) # FUZZ
+diff --git a/tests/fuzz/fuzz_parser_configuration.h b/tests/fuzz/fuzz_parser_configuration.h
+new file mode 100644
+index 000000000..836fb7408
+--- /dev/null
++++ b/tests/fuzz/fuzz_parser_configuration.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <iostream>
++#include <vector>
++#include <cstdint>
++
++enum class Endian { Big, Little };
++
++// Toggle whether the payload includes a total length prefix at the very beginning
++constexpr bool HAS_TOTAL_LEN_PREFIX = true;
++
++// Define the byte-sizes by setting the underlying integer types.
++// Change to uint16_t (2 bytes), uint8_t (1 byte), or uint64_t (8 bytes) as needed.
++using TotalLenType = uint32_t; 
++using PktLenType   = uint32_t; 
++
++// Set the endianness of the incoming fuzzer payload
++constexpr Endian ENCODING = Endian::Big;
++
++// =========================================================================
++// TEMPLATED READER FUNCTION
++// =========================================================================
++// This single function automatically adapts to the byte-size of the type (T) 
++// and the chosen endianness without any runtime overhead.
++template <typename T, Endian E = ENCODING>
++inline T read_len(const uint8_t* buf) {
++    T result = 0;
++    if constexpr (E == Endian::Big) {
++        for (size_t i = 0; i < sizeof(T); ++i) {
++            result = (result << 8) | buf[i];
++        }
++    } else {
++        for (size_t i = 0; i < sizeof(T); ++i) {
++            result |= (static_cast<T>(buf[i]) << (i * 8));
++        }
++    }
++    return result;
++}
+\ No newline at end of file
+diff --git a/tests/fuzz/fuzz_test_form_join.cpp b/tests/fuzz/fuzz_test_form_join.cpp
+new file mode 100644
+index 000000000..efb8a44c4
+--- /dev/null
++++ b/tests/fuzz/fuzz_test_form_join.cpp
+@@ -0,0 +1,166 @@
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#include <iostream>
++#include <vector>
++#include <unistd.h>
++#include <sys/shm.h>
++#include <algorithm>
++
++#include "platform/nexus_core.hpp"
++#include "platform/nexus_node.hpp"
++
++#include "fuzz_parser_configuration.h"
++
++// =========================================================================
++// THE "IN-PROCESS BRAIN" STATE
++// =========================================================================
++std::vector<std::vector<uint8_t>> g_input_queue;
++size_t g_input_index = 0;
++
++// =========================================================================
++// THE INTERCEPTION HOOK 
++// =========================================================================
++
++extern "C" size_t libafl_process(uint8_t* buf, size_t buf_len, size_t max_len) {
++    // 1. ACTION (INJECTION): Replace OpenThread's buffer with our mutated packet
++    if (g_input_index < g_input_queue.size()) {
++        std::cout << "[FUZZING!]" << std::endl;
++        const auto& packet = g_input_queue[g_input_index];
++        size_t copy_len = std::min(packet.size(), max_len);
++        memcpy(buf, packet.data(), copy_len);
++        
++        g_input_index++;
++        return copy_len;
++    } else {
++        std::cout << "[UNCHANGED!]" << std::endl;
++    }
++    
++    return buf_len;
++}
++
++// =========================================================================
++// THE OPENTHREAD TARGET
++// =========================================================================
++
++namespace ot {
++namespace Nexus {
++
++size_t MaliciousNodeID_g = 0;
++bool AllNodesMalicious_g = false;
++
++enum class MaliciousRole { None, Leader, Fed, Both };
++
++void TestFormJoin(void)
++{
++    Core nexus;
++    Node &leader  = nexus.CreateNode();
++    Node &fed     = nexus.CreateNode();
++
++#ifdef MALICIOUS_LEADER
++    MaliciousNodeID_g = leader.GetId(); // Let the Leader mutate the packets
++    AllNodesMalicious_g = false;
++#elif defined(MALICIOUS_FED)
++    MaliciousNodeID_g = fed.GetId(); // Let the Fed mutate the packets
++    AllNodesMalicious_g = false;
++#elif defined(MALICIOUS_BOTH)
++    #warning "Treating both nodes as malicious."
++    AllNodesMalicious_g = true;
++#else
++    #error "Please define one of MALICIOUS_LEADER, MALICIOUS_FED, or MALICIOUS_BOTH to specify which node(s) should be malicious."
++#endif
++
++    nexus.AdvanceTime(0);
++
++    leader.Form();
++    nexus.AdvanceTime(13 * 1000);
++
++    fed.Join(leader, Node::kAsFed);
++    nexus.AdvanceTime(5 * 1000);
++}
++
++} 
++}
++// =========================================================================
++// THE HARNESS
++// =========================================================================
++
++int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
++    srand(0U);
++
++    g_input_queue.clear();
++    g_input_index = 0;
++
++    size_t cursor = 0;
++
++    // 1. Process the total length prefix (if enabled)
++    if constexpr (HAS_TOTAL_LEN_PREFIX) {
++        if (size < sizeof(TotalLenType)) {
++            return 0; // Payload too small to even contain the total length header
++        }
++        
++        TotalLenType expected_len = read_len<TotalLenType>(data);
++        if (size != static_cast<size_t>(expected_len) + sizeof(TotalLenType)) {
++            std::cerr << "SIZE MISMATCH! EXITING" << std::endl;
++            return -1;
++        }
++        cursor += sizeof(TotalLenType);
++    }
++
++    // 2. Parse individual packets
++    while (cursor + sizeof(PktLenType) <= size) {
++        PktLenType len = read_len<PktLenType>(&data[cursor]);
++        cursor += sizeof(PktLenType);
++
++        if (cursor + len <= size) {
++            // Ignore 0-byte payloads
++            if (len > 0) {
++                // emplace_back is slightly more efficient than push_back here
++                g_input_queue.emplace_back(
++                    data + cursor, 
++                    data + cursor + len
++                );
++            }
++            cursor += len;
++        } else {
++            break; // Truncated/corrupted payload, stop parsing safely
++        }
++    }
++
++    ot::Nexus::TestFormJoin();
++
++    return 0;
++}
++
++
++int main(int argc, char **argv) {
++
++    srand(0); // Ensure deterministic behavior for the fuzzer
++
++    if (argc < 2) {
++        fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
++        return 1;
++    }
++
++    FILE *f = fopen(argv[1], "rb");
++    if (!f) {
++        perror("Failed to open file");
++        return 1;
++    }
++
++    fseek(f, 0, SEEK_END);
++    size_t length = ftell(f);
++    fseek(f, 0, SEEK_SET);
++
++    uint8_t *buffer = (uint8_t*)malloc(length);
++    if (!buffer) return 1;
++
++    fread(buffer, 1, length, f);
++    fclose(f);
++
++    // Call the harness once
++    LLVMFuzzerTestOneInput(buffer, length);
++
++    free(buffer);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/tests/nexus/CMakeLists.txt b/tests/nexus/CMakeLists.txt
+index b70224027..615deb267 100644
+--- a/tests/nexus/CMakeLists.txt
++++ b/tests/nexus/CMakeLists.txt
+@@ -76,6 +76,8 @@ set(COMMON_LIBS
+     openthread-ftd
+ )
+ 
++target_compile_definitions(ot-config INTERFACE "OPENTHREAD_CONFIG_RADIO_LINK_TREL_ENABLE=1")
++
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+ macro(ot_nexus_test name)
+@@ -111,9 +113,9 @@ endmacro()
+ 
+ #----------------------------------------------------------------------------------------------------------------------
+ 
+-ot_nexus_test(border_agent)
+-ot_nexus_test(dtls)
+-ot_nexus_test(form_join)
+-ot_nexus_test(full_network_reset)
+-ot_nexus_test(large_network)
+-ot_nexus_test(trel)
++# ot_nexus_test(border_agent)
++# ot_nexus_test(dtls)
++# ot_nexus_test(form_join)
++# ot_nexus_test(full_network_reset)
++# ot_nexus_test(large_network)
++# ot_nexus_test(trel)
+diff --git a/tests/nexus/platform/nexus_core.cpp b/tests/nexus/platform/nexus_core.cpp
+index 34a18917b..e8699d00a 100644
+--- a/tests/nexus/platform/nexus_core.cpp
++++ b/tests/nexus/platform/nexus_core.cpp
+@@ -29,8 +29,13 @@
+ #include "nexus_core.hpp"
+ #include "nexus_node.hpp"
+ 
++extern "C" size_t libafl_process(uint8_t* buf, size_t buf_len, size_t max_len);
++
+ namespace ot {
+ namespace Nexus {
++    
++extern size_t MaliciousNodeID_g;
++extern bool AllNodesMalicious_g;
+ 
+ Core *Core::sCore  = nullptr;
+ bool  Core::sInUse = false;
+@@ -153,6 +158,27 @@ void Core::ProcessRadio(Node &aNode)
+ 
+             Radio::Frame rxFrame(aNode.mRadio.mTxFrame);
+ 
++#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
++            if (AllNodesMalicious_g || aNode.GetId() == MaliciousNodeID_g) { // Let the malicious node mutate the packets
++                // quick_dissect(rxFrame.mPsduBuffer, rxFrame.mLength);
++                // printf("Original Frame: ");
++                // for (int i = 0; i < rxFrame.mLength; i++) {
++                //     printf("%02X ", rxFrame.mPsduBuffer[i]);
++                // }
++                // printf("\n");
++                rxFrame.mLength = libafl_process(
++                    rxFrame.mPsduBuffer, 
++                    rxFrame.mLength, 
++                    OT_RADIO_FRAME_MAX_SIZE
++                );
++                // printf("Fuzzer Frame: ");
++                // for (int i = 0; i < rxFrame.mLength; i++) {
++                //     printf("%02X ", rxFrame.mPsduBuffer[i]);
++                // }
++                // printf("\n");
++            }
++#endif
++
+             rxFrame.mInfo.mRxInfo.mTimestamp = (mNow.GetValue() * 1000u);
+             rxFrame.mInfo.mRxInfo.mRssi      = kDefaultRxRssi;
+             rxFrame.mInfo.mRxInfo.mLqi       = 0;
+diff --git a/tests/nexus/platform/nexus_misc.cpp b/tests/nexus/platform/nexus_misc.cpp
+index a56ed29fa..463cac9e9 100644
+--- a/tests/nexus/platform/nexus_misc.cpp
++++ b/tests/nexus/platform/nexus_misc.cpp
+@@ -137,11 +137,13 @@ void              otPlatWakeHost(void) {}
+ 
+ void Log(const char *aFormat, ...)
+ {
++#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+     va_list args;
+ 
+     va_start(args, aFormat);
+     LogVarArgs(nullptr, aFormat, args);
+     va_end(args);
++#endif
+ }
+ 
+ static void LogVarArgs(Node *aActiveNode, const char *aFormat, va_list aArgs)

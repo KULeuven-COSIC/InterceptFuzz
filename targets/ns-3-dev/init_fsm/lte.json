@@ -1,0 +1,43 @@
+{
+    "state_counter_": 4,
+    "transitions": [
+        {
+            "from_state": 1,
+            "packet": [
+                64,
+                0,
+                0,
+                0,
+                0,
+                22
+            ],
+            "to_state": 2
+        },
+        {
+            "from_state": 2,
+            "packet": [
+                126,
+                129,
+                8,
+                140,
+                28,
+                136,
+                26,
+                64,
+                0,
+                148,
+                0,
+                0
+            ],
+            "to_state": 3
+        },
+        {
+            "from_state": 3,
+            "packet": [
+                34,
+                64
+            ],
+            "to_state": 4
+        }
+    ]
+}

@@ -1,0 +1,19 @@
+{
+  "No Crash": "Execution successful",
+  "Excluded 1": "Assertion `aMaxSize <= Address::kSize' failed",
+  "Excluded 2": "src/core/common/data.hpp:194:45",
+  "C1": "Assertion `(aRemoveLength <= mLength) && (GetBytes() <= removeStart) && (removeEnd <= end)' failed",
+  "Excluded 3": "Assertion `aDelay <= kMaxDelay' failed",
+  "Excluded 4": "Assertion `leader != nullptr' failed",
+  "Excluded 5": "src/core/net/ip6_address.cpp:69:5",
+  "Excluded 6": "src/core/thread/network_data.cpp:477:33",
+  "Excluded 7": "src/core/thread/network_data.cpp:527:18",
+  "C2": "Assertion `aMessage.GetLength() <= aFrame.GetMaxPayloadLength()' failed",
+  "C3": "src/core/common/timer.hpp:168:42",
+  "C4": "src/core/thread/network_data_tlvs.hpp:403:44",
+  "Excluded 8": "src/core/thread/network_data_tlvs.hpp:869:44",
+  "C5": "src/core/thread/network_data_tlvs.hpp:233:56",
+  "Excluded 9": "src/core/thread/network_data_tlvs.hpp:185:67",
+  "C6": "src/core/thread/network_data_tlvs.hpp:914:61",
+  "C7": "src/core/thread/network_data_tlvs.hpp:219:57"
+}
