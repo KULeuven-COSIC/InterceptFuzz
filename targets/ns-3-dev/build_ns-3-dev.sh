@@ -19,7 +19,8 @@ show_help() {
     echo "Must be run from the parent directory containing the ns-3 environments."
     echo ""
     echo "Required Arguments:"
-    echo "  -f, --fuzzer FUZZER      interceptfuzz, concat, aflnet, all, or coverage (coverage build only)"
+    echo "  -f, --fuzzer FUZZER      interceptfuzz, concat, aflnet, all, coverage (coverage build only)"
+    echo "                           or asan (AddressSanitizer build only, for crash triage)"
     echo "  -p, --protocol PROTOCOL  Set the target protocol: WIFI or LTE"
     echo ""
     echo "Optional Arguments:"
@@ -72,10 +73,14 @@ case "$FUZZER" in
     interceptfuzz|concat|aflnet) DIRS=("ns-3-dev-$FUZZER") ;;
     all) DIRS=(ns-3-dev-interceptfuzz ns-3-dev-concat ns-3-dev-aflnet) ;;
     coverage) DIRS=() ;;
+    asan) DIRS=() ;;
     *) echo "Error: Unknown fuzzer target '$FUZZER'."; exit 1 ;;
 esac
 
-for d in ns-3-dev-cov "${DIRS[@]}"; do
+NEEDED=(ns-3-dev-cov "${DIRS[@]}")
+[[ "$FUZZER" == "asan" ]] && NEEDED=(ns-3-dev-asan)
+
+for d in "${NEEDED[@]}"; do
     if [[ ! -d "$d" ]]; then
         echo "Error: '$d' not found!"
         exit 1
@@ -176,6 +181,17 @@ if [ "$VERBOSE_MODE" -eq 1 ]; then
     COV_CXXFLAGS="$COV_CXXFLAGS -DFUZZ_VERBOSE"
 fi
 COV_LDFLAGS="-fuse-ld=lld"
+
+if [[ "$FUZZER" == "asan" ]]; then
+    ASAN_CXXFLAGS="-DCMAKE_EXE_LINKER_FLAGS=\"-fuse-ld=lld\" -fsanitize=address -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -O0 -g"
+    [ "$VERBOSE_MODE" -eq 1 ] && ASAN_CXXFLAGS="$ASAN_CXXFLAGS -DFUZZ_VERBOSE"
+    build_environment "ns-3-dev-asan" "clang++" "clang" \
+                      "$ASAN_CXXFLAGS" "-fuse-ld=lld" \
+                      "AddressSanitizer Target"
+    echo ""
+    echo "[+] Built ns-3-dev-asan/build/scratch/fuzz/ns3-dev-target-default"
+    exit 0
+fi
 
 # 1. Coverage environment (always required)
 build_environment "ns-3-dev-cov" "clang++" "clang" \

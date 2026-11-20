@@ -7,10 +7,11 @@ RUN git clone https://github.com/openthread/openthread.git && \
     cd openthread && \
     git checkout 01bce95ba2f191e9dc378a0d71e8fc0bd7d9c9a9
 
-# One source tree per fuzzer + one for coverage
+# One source tree per fuzzer, one for coverage and one for AddressSanitizer
 RUN cp -r /workspace/openthread /workspace/openthread-aflnet \
     && cp -r /workspace/openthread /workspace/openthread-concat \
     && cp -r /workspace/openthread /workspace/openthread-cov \
+    && cp -r /workspace/openthread /workspace/openthread-asan \
     && mv /workspace/openthread /workspace/openthread-interceptfuzz
 
 COPY patches/ /tmp/patches/
@@ -26,6 +27,10 @@ RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/aflnet.patc
 
 WORKDIR /workspace/openthread-cov
 RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/coverage.patch
+
+# AddressSanitizer build, used to replay queues for memory errors (crash triage)
+WORKDIR /workspace/openthread-asan
+RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/asan.patch
 
 WORKDIR /workspace
 

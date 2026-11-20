@@ -47,8 +47,32 @@ python3 analysis/crashes/dedup_crashes.py -d <run>/all_crashes -b <binary> \
 
 `all_crashes/` holds the crashes of the campaign together with those found by replaying
 its non-minimized queue on an AddressSanitizer build. The OpenThread signatures C3–C7
-are memory errors (a SEGV and stack buffer overflows), which that replay exposes. The
-ASan build is not part of this artifact yet.
+are memory errors (a SEGV and stack buffer overflows), which that replay exposes.
+
+The ASan builds are made inside the target images (`targets/*/patches/asan.patch`), and
+`crashes/asan_triage.sh` replays a queue on them and saves the crashing inputs:
+
+```bash
+# OpenThread
+./build_openthread.sh -f asan
+/workspace/analysis/crashes/asan_triage.sh \
+    -t /workspace/openthread-asan/build/tests/fuzz/fuzz_test_form_join-fuzzer \
+    -s <run>/replayable_queue -o <run>/asan_crashes
+
+# ns-3 (Wi-Fi or LTE)
+./build_ns-3-dev.sh -f asan -p WIFI
+/workspace/analysis/crashes/asan_triage.sh \
+    -t /workspace/ns-3-dev-asan/build/scratch/fuzz/ns3-dev-target-default \
+    -s <run>/replayable_queue -o <run>/asan_crashes
+```
+
+`all_crashes/` is the union of the crashing inputs of the campaign (`replayable_crashes/`)
+and those of the ASan replay (`asan_crashes/`). Create it before running `dedup_crashes.py`:
+
+```bash
+mkdir -p <run>/all_crashes
+cp <run>/replayable_crashes/* <run>/asan_crashes/* <run>/all_crashes/
+```
 
 - **First match wins:** a rule matches if its text appears in the output of the crashing run, and the first matching rule in the file decides the signature.
 - **OpenThread names:** `C1`–`C7` in `ot_rules.json` are the signatures of Table III. The `Excluded N` rules are signatures that are not reported in the paper. They stay in the file, so that every input keeps the signature it had in the paper.

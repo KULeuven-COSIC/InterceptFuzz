@@ -45,7 +45,7 @@ git submodule update --init
 The images are:
 
 - `interceptfuzz-base`: Ubuntu 22.04, clang-18, AFL++ `247e8241`, Rust, the AFLNet (LibAFL) binary, and the InterceptFuzz library.
-- `interceptfuzz-openthread` and `interceptfuzz-ns-3-dev`: the target sources, with one patched tree per fuzzer plus a coverage tree.
+- `interceptfuzz-openthread` and `interceptfuzz-ns-3-dev`: the target sources, with one patched tree per fuzzer plus a coverage tree and an AddressSanitizer tree.
 
 The targets themselves are compiled when a campaign starts (`-b`). A shared ccache in
 `.ccache/` makes later builds fast.
@@ -159,10 +159,13 @@ analysis/          tables and figures of the paper, crash triage (crashes/)
 results/           the paper's campaigns (downloaded, see results/README.md)
 ```
 
-Each target has four patches:
+Each target has five patches:
 
 - `interceptfuzz.patch`, `concat.patch`, `aflnet.patch`: the fuzzing harness and the interception hooks for that fuzzer.
 - `coverage.patch`: the coverage build.
+- `asan.patch`: the AddressSanitizer build used for crash triage (`-f asan`, see `analysis/README.md`).
+  For ns-3 it is the same as `coverage.patch`; for OpenThread it additionally lets the
+  harness deliver zero-length packets.
 
 ## Using InterceptFuzz on another stack
 

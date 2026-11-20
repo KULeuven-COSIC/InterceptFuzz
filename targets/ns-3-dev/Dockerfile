@@ -7,10 +7,11 @@ RUN git clone https://gitlab.com/nsnam/ns-3-dev.git && \
     cd ns-3-dev && \
     git checkout be3db7b65393a43537393448b3d7e456267cf8c5
 
-# One source tree per fuzzer + one for coverage
+# One source tree per fuzzer, one for coverage and one for AddressSanitizer
 RUN cp -r /workspace/ns-3-dev /workspace/ns-3-dev-aflnet \
     && cp -r /workspace/ns-3-dev /workspace/ns-3-dev-concat \
     && cp -r /workspace/ns-3-dev /workspace/ns-3-dev-cov \
+    && cp -r /workspace/ns-3-dev /workspace/ns-3-dev-asan \
     && mv /workspace/ns-3-dev /workspace/ns-3-dev-interceptfuzz
 
 COPY patches/ /tmp/patches/
@@ -26,6 +27,10 @@ RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/aflnet.patc
 
 WORKDIR /workspace/ns-3-dev-cov
 RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/coverage.patch
+
+# AddressSanitizer build, used to replay queues for memory errors (crash triage)
+WORKDIR /workspace/ns-3-dev-asan
+RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/asan.patch
 
 WORKDIR /workspace
 

@@ -79,4 +79,7 @@ COPY fuzzers/concat /workspace/fuzzers/concat
 # Coverage collection and run statistics (shared by all fuzzers)
 COPY common /workspace/common
 
+# Crash triage (ASan replay, signature assignment)
+COPY analysis/crashes /workspace/analysis/crashes
+
 CMD ["/bin/bash"]

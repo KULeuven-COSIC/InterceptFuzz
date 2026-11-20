@@ -3,8 +3,9 @@
 # Configure and build the OpenThread (Nexus simulation) environments.
 # Run from /workspace inside the openthread image.
 #
-#   openthread-cov            coverage build (gcov), always built
+#   openthread-cov            coverage build (gcov), built with every fuzzer
 #   openthread-<FUZZER>       fuzzing build of the selected fuzzer
+#   openthread-asan           AddressSanitizer build for crash triage (-f asan only)
 # =============================================================================
 set -e
 
@@ -20,7 +21,8 @@ show_help() {
     echo "Must be run from the directory containing the OpenThread environments (/workspace)."
     echo ""
     echo "Required Arguments:"
-    echo "  -f, --fuzzer FUZZER  interceptfuzz, concat, aflnet, all, or coverage (coverage build only)"
+    echo "  -f, --fuzzer FUZZER  interceptfuzz, concat, aflnet, all, coverage (coverage build only)"
+    echo "                       or asan (AddressSanitizer build only, for crash triage)"
     echo ""
     echo "Optional Arguments:"
     echo "  -r, --role ROLE      Malicious role; the paper uses BOTH (default: BOTH)"
@@ -53,13 +55,15 @@ fi
 FUZZING_MODE="MALICIOUS_${ROLE}"
 
 case "$FUZZER" in
-    interceptfuzz|concat|aflnet|coverage) DIRS=("openthread-$FUZZER") ;;
+    interceptfuzz|concat|aflnet|coverage|asan) DIRS=("openthread-$FUZZER") ;;
     all) DIRS=(openthread-interceptfuzz openthread-concat openthread-aflnet) ;;
     *) echo "Error: Unknown fuzzer '$FUZZER'."; show_help; exit 1 ;;
 esac
 [[ "$FUZZER" == "coverage" ]] && DIRS=()
+NEEDED=(openthread-cov "${DIRS[@]}")
+[[ "$FUZZER" == "asan" ]] && NEEDED=(openthread-asan)
 
-for d in openthread-cov "${DIRS[@]}"; do
+for d in "${NEEDED[@]}"; do
     if [[ ! -d "$d" ]]; then
         echo "Error: '$d' not found!"
         exit 1
@@ -134,6 +138,17 @@ if [ "$VERBOSE_MODE" -eq 1 ]; then
     COV_CXXFLAGS="$COV_CXXFLAGS -DFUZZ_VERBOSE"
 fi
 COV_LDFLAGS="-fuse-ld=lld"
+
+if [[ "$FUZZER" == "asan" ]]; then
+    ASAN_CFLAGS="-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -D${FUZZING_MODE} -fsanitize=address"
+    [ "$VERBOSE_MODE" -eq 1 ] && ASAN_CFLAGS="$ASAN_CFLAGS -DFUZZ_VERBOSE"
+    build_environment "openthread-asan" "clang++" "clang" \
+                      "$ASAN_CFLAGS" "-fuse-ld=lld" \
+                      "AddressSanitizer Target"
+    echo ""
+    echo "[+] Built openthread-asan/build/tests/fuzz/fuzz_test_form_join-fuzzer"
+    exit 0
+fi
 
 # 1. Coverage environment (always required)
 build_environment "openthread-cov" "clang++" "clang" \
