@@ -10,8 +10,26 @@ The campaigns behind every table and figure of the paper. There are two archives
 | `interceptfuzz-raw-aflnet-ports.tar.zst` | the same as `interceptfuzz-raw.tar.zst` for AFLNet-pp and AFLNet-real | measuring their coverage again, triaging their crashes again |
 
 The `-aflnet-ports` archives hold only the added fuzzers and unpack into the same folders
-as the main archives. All archives are kept in this folder and are not committed (see `.gitignore`).
-TODO: publish them (e.g. on Zenodo) and link them here.
+as the main archives. The archives are not committed (see `.gitignore`). They are attached
+to the GitHub releases of this repository:
+
+| Release | Archives |
+|---|---|
+| [`arxiv-v1`](https://github.com/KULeuven-COSIC/InterceptFuzz/releases/tag/arxiv-v1) | `interceptfuzz-results.tar.gz`, `interceptfuzz-raw.tar.zst` (the campaigns of the [arXiv paper](https://arxiv.org/abs/2611.03709)) |
+| [`aflnet-ports-v1`](https://github.com/KULeuven-COSIC/InterceptFuzz/releases/tag/aflnet-ports-v1) | `interceptfuzz-results-aflnet-ports.tar.gz`, `interceptfuzz-raw-aflnet-ports.tar.zst` |
+
+Download them into this folder:
+
+```bash
+REL=https://github.com/KULeuven-COSIC/InterceptFuzz/releases/download
+wget -P results/ $REL/arxiv-v1/interceptfuzz-results.tar.gz
+wget -P results/ $REL/arxiv-v1/interceptfuzz-raw.tar.zst                        # only to redo measurements
+wget -P results/ $REL/aflnet-ports-v1/interceptfuzz-results-aflnet-ports.tar.gz  # optional
+wget -P results/ $REL/aflnet-ports-v1/interceptfuzz-raw-aflnet-ports.tar.zst     # optional
+```
+
+or, with the GitHub CLI, `gh release download arxiv-v1 -D results/` and
+`gh release download aflnet-ports-v1 -D results/`.
 
 Unpack the results archive here and regenerate the tables and figures:
 
