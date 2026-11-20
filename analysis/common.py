@@ -7,7 +7,7 @@ artifact; both use the same layout. Statistics follow the paper: medians with
 with tie and continuity correction, i.e. scipy's default for samples of size 10),
 and the Vargha-Delaney A12 effect size.
 """
-import glob, gzip, json, math, os
+import glob, gzip, json, math, os, re
 from decimal import Decimal, ROUND_HALF_UP
 import statistics as st
 
@@ -15,9 +15,20 @@ OT = 'openthread/BOTH/86400s'
 WIFI = 'ns-3-dev/WIFI/36000s'
 LTE = 'ns-3-dev/LTE/36000s'
 TARGETS = {'OpenThread Nexus': OT, 'ns-3 Wi-Fi': WIFI, 'ns-3 LTE': LTE}
-# fuzzer label -> sub-folder per target
+# fuzzer label -> sub-folder per target (the fuzzers of the first paper version)
 FUZZERS = {t: {'AFLNet': 'aflnet', 'Concat': 'concat', 'InterceptFuzz': 'interceptfuzz/5_iter/linear'}
            for t in TARGETS}
+# AFLNet ports added later: AFLNet's algorithm on AFL++ (AFLNet-pp) and the original
+# AFLNet with an in-process transport (AFLNet-real). The scripts include them when
+# the results folder has runs of them.
+EXTRA_FUZZERS = {'AFLNet-pp': 'aflnet-pp', 'AFLNet-real': 'aflnet-real'}
+
+
+def all_fuzzers(root, tgt):
+    """FUZZERS[tgt] plus the extra fuzzers that have runs in root."""
+    out = dict(FUZZERS[tgt])
+    out.update({f: sub for f, sub in EXTRA_FUZZERS.items() if runs(os.path.join(root, TARGETS[tgt]), sub)})
+    return out
 # epoch settings of InterceptFuzz on OpenThread Nexus (Table VI)
 SETTINGS = {'5L': 'interceptfuzz/5_iter/linear', '5U': 'interceptfuzz/5_iter/uniform',
             '10L': 'interceptfuzz/10_iter/linear', '10U': 'interceptfuzz/10_iter/uniform'}
@@ -76,13 +87,24 @@ def iterations(run):
     return sorted(int(x.split('_')[-1]) for x in os.listdir(base) if x.startswith('iter_'))
 
 
+def campaign_seconds(run):
+    """Campaign length from the results layout (<...>/<seconds>s/<fuzzer>/...)."""
+    m = re.search(r'/(\d+)s/', run.replace(os.sep, '/'))
+    return int(m.group(1)) if m else None
+
+
 def final_stats(run):
-    """Final coverage (branches, lines, functions) and execs/s from statistics.json."""
+    """Final coverage (branches, lines, functions) and execs/s from statistics.json.
+    execs/s is the fuzzer's average, except for AFLNet-real, whose fuzzer_stats only
+    has the speed at the end of the campaign: there it is execs_total / campaign length."""
     d = load_json(find(run, 'statistics.json'))
     its = [i for i in d['iterations'] if ((i.get('coverage') or {}).get('branches') or {}).get('covered') is not None]
     c = its[-1]['coverage']
+    execs = d.get('execs_per_sec')
+    if '/aflnet-real/' in run.replace(os.sep, '/') and d.get('execs_total') and campaign_seconds(run):
+        execs = d['execs_total'] / campaign_seconds(run)
     return dict(branches=c['branches']['covered'], lines=c['lines']['covered'],
-                functions=c['functions']['covered'], execs=d.get('execs_per_sec'))
+                functions=c['functions']['covered'], execs=execs)
 
 
 def r(x):

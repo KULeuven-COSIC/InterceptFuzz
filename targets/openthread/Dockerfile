@@ -9,6 +9,8 @@ RUN git clone https://github.com/openthread/openthread.git && \
 
 # One source tree per fuzzer, one for coverage and one for AddressSanitizer
 RUN cp -r /workspace/openthread /workspace/openthread-aflnet \
+    && cp -r /workspace/openthread /workspace/openthread-aflnet-pp \
+    && cp -r /workspace/openthread /workspace/openthread-aflnet-real \
     && cp -r /workspace/openthread /workspace/openthread-concat \
     && cp -r /workspace/openthread /workspace/openthread-cov \
     && cp -r /workspace/openthread /workspace/openthread-asan \
@@ -24,6 +26,12 @@ RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/concat.patc
 
 WORKDIR /workspace/openthread-aflnet
 RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/aflnet.patch
+
+WORKDIR /workspace/openthread-aflnet-pp
+RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/aflnet-pp.patch
+
+WORKDIR /workspace/openthread-aflnet-real
+RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/aflnet-real.patch
 
 WORKDIR /workspace/openthread-cov
 RUN git apply --ignore-space-change --ignore-whitespace /tmp/patches/coverage.patch

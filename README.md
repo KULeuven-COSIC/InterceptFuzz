@@ -1,6 +1,6 @@
 # InterceptFuzz
 
-Artifact for the InterceptFuzz paper: the fuzzer, the two fuzzers it is compared with, the
+Artifact for the InterceptFuzz paper: the fuzzer, the fuzzers it is compared with, the
 patched targets, and everything needed to rerun the evaluation in Docker.
 
 | Fuzzer | Directory | What it does |
@@ -8,6 +8,8 @@ patched targets, and everything needed to rerun the evaluation in Docker.
 | **InterceptFuzz** | `fuzzers/interceptfuzz/` | Intercepts packets inside the running protocol stack and mutates them in place. Runs AFL++ over several iterations and carries the reached states over from one iteration to the next. |
 | **Concat** | `fuzzers/concat/` | AFL++ on a whole packet sequence. Packets are separated by a `0xDEAD` delimiter. |
 | **AFLNet** | `fuzzers/aflnet/` | AFLNet reimplemented on LibAFL (state-aware, with the in-process transport). |
+| **AFLNet-pp** | `fuzzers/aflnet-pp/` | AFLNet's algorithm ported onto the same AFL++ version as Concat and InterceptFuzz, with the same harness, input format and seeds as Concat. |
+| **AFLNet-real** | `fuzzers/aflnet-real/` | The original AFLNet, with an in-process transport (`-N ipc://`) instead of sockets. |
 
 | Target | Version | Harness | Paper experiment |
 |---|---|---|---|
@@ -44,7 +46,7 @@ git submodule update --init
 
 The images are:
 
-- `interceptfuzz-base`: Ubuntu 22.04, clang-18, AFL++ `247e8241`, Rust, the AFLNet (LibAFL) binary, and the InterceptFuzz library.
+- `interceptfuzz-base`: Ubuntu 22.04, clang-18, AFL++ `247e8241`, Rust, the AFLNet (LibAFL) binary, AFLNet-pp, AFLNet-real, and the InterceptFuzz library.
 - `interceptfuzz-openthread` and `interceptfuzz-ns-3-dev`: the target sources, with one patched tree per fuzzer plus a coverage tree and an AddressSanitizer tree.
 
 The targets themselves are compiled when a campaign starts (`-b`). A shared ccache in
@@ -60,11 +62,15 @@ on to the target's run script (`targets/<target>/run_*_fuzzing.sh`, see `-h`).
 ./run_docker.sh -t openthread -C 0-1 -f interceptfuzz -n 5 -D linear -T 86400 -b
 ./run_docker.sh -t openthread -C 2-3 -f concat -T 86400 -b
 ./run_docker.sh -t openthread -C 4-5 -f aflnet -T 86400 -b
+./run_docker.sh -t openthread -C 6-7 -f aflnet-pp -T 86400 -b
+./run_docker.sh -t openthread -C 6-7 -f aflnet-real -T 86400 -b
 
 # ns-3, 10 h
 ./run_docker.sh -t ns-3-dev -C 0-1 -f interceptfuzz -p WIFI -n 5 -D linear -T 36000 -b
 ./run_docker.sh -t ns-3-dev -C 2-3 -f concat -p LTE -T 36000 -b
 ./run_docker.sh -t ns-3-dev -C 4-5 -f aflnet -p WIFI -T 36000 -b
+./run_docker.sh -t ns-3-dev -C 6-7 -f aflnet-pp -p LTE -T 36000 -b
+./run_docker.sh -t ns-3-dev -C 6-7 -f aflnet-real -p WIFI -T 36000 -b
 ```
 
 For a quick functional check, use `-T 120`.
@@ -74,9 +80,10 @@ InterceptFuzz options:
 - `-n`: number of iterations.
 - `-D`: how the time budget is split over the iterations (`linear` or `uniform`).
 
-Concat starts from seeds generated from the initial state machine in
-`targets/<target>/init_fsm/`. AFLNet starts from the packets the harness records in a
-first, unmodified run.
+Concat, AFLNet-pp and AFLNet-real start from seeds generated from the initial state
+machine in `targets/<target>/init_fsm/`. AFLNet starts from the packets the harness
+records in a first, unmodified run. AFLNet-pp and AFLNet-real run with AFLNet's
+ProFuzzBench settings (`-E -R -q 3 -s 3`); see their READMEs in `fuzzers/`.
 
 ## Reproducing the paper's experiments
 
@@ -85,10 +92,10 @@ the given cores. Start one instance per core pair to run campaigns in parallel:
 
 ```bash
 # OpenThread (BOTH), 24 h:
-#   InterceptFuzz {5,10} iterations x {linear,uniform}, Concat, AFLNet
+#   InterceptFuzz {5,10} iterations x {linear,uniform}, Concat, AFLNet, AFLNet-pp, AFLNet-real
 ./experiments/run_experiments.sh -t openthread -C 0-1 -n 10
 
-# ns-3, 10 h: InterceptFuzz 5 iterations x {linear,uniform}, Concat, AFLNet
+# ns-3, 10 h: InterceptFuzz 5 iterations x {linear,uniform}, Concat, AFLNet, AFLNet-pp, AFLNet-real
 ./experiments/run_experiments.sh -t ns-3-dev -p WIFI -C 2-3 -n 10
 ./experiments/run_experiments.sh -t ns-3-dev -p LTE  -C 4-5 -n 10
 ```
@@ -147,6 +154,8 @@ fuzzers/
                    and campaign driver (scripts/run_interceptfuzz.sh)
   concat/          Concat driver and seed conversion
   aflnet/          AFLNet on LibAFL (Rust)
+  aflnet-pp/       AFLNet's algorithm as a patch against AFL++ (built in the base image)
+  aflnet-real/     the original AFLNet with an in-process transport, as a patch (built in the base image)
 common/            coverage replay (gcovr), run statistics, coverage re-collection
 third_party/
   butterfly/       LibAFL components for stateful fuzzing (git submodule)
@@ -159,9 +168,9 @@ analysis/          tables and figures of the paper, crash triage (crashes/)
 results/           the paper's campaigns (downloaded, see results/README.md)
 ```
 
-Each target has five patches:
+Each target has seven patches:
 
-- `interceptfuzz.patch`, `concat.patch`, `aflnet.patch`: the fuzzing harness and the interception hooks for that fuzzer.
+- `interceptfuzz.patch`, `concat.patch`, `aflnet.patch`, `aflnet-pp.patch`, `aflnet-real.patch`: the fuzzing harness and the interception hooks for that fuzzer. `aflnet-pp.patch` and `aflnet-real.patch` share the harness: Concat's `0xDEAD` parser plus the outbox trace AFLNet reads its states from; `aflnet-real.patch` has a plain `main()` instead of the libFuzzer entry point.
 - `coverage.patch`: the coverage build.
 - `asan.patch`: the AddressSanitizer build used for crash triage (`-f asan`, see `analysis/README.md`).
   For ns-3 it is the same as `coverage.patch`; for OpenThread it additionally lets the

@@ -15,7 +15,7 @@ from common import *
 root = root_arg(sys.argv)
 print('=== Table II ===')
 for tgt, rel in TARGETS.items():
-    data = {f: [final_stats(x) for x in runs(os.path.join(root, rel), sub)] for f, sub in FUZZERS[tgt].items()}
+    data = {f: [final_stats(x) for x in runs(os.path.join(root, rel), sub)] for f, sub in all_fuzzers(root, tgt).items()}
     print(f'-- {tgt} ({", ".join(f"{f}: {len(v)} runs" for f, v in data.items())})')
     ifb = [d['branches'] for d in data['InterceptFuzz']]
     for f, v in data.items():
@@ -23,7 +23,7 @@ for tgt, rel in TARGETS.items():
         for k, (name, b) in enumerate(zip(('branches', 'lines', 'functions'), BENIGN[tgt])):
             vals = [d[name] for d in v]
             cells.append(f'{name} {med_range(vals)} (delta {fmt(r(st.median(vals)) - b)})')
-        ex = [d['execs'] for d in v if d['execs'] is not None]
+        ex = [r(d['execs']) for d in v if d['execs'] is not None]
         stat = ''
         if f != 'InterceptFuzz':
             b = [d['branches'] for d in v]

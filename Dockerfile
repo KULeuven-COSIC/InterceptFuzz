@@ -82,4 +82,22 @@ COPY common /workspace/common
 # Crash triage (ASan replay, signature assignment)
 COPY analysis/crashes /workspace/analysis/crashes
 
+# AFLNet-real: the original AFLNet (commit 96032f8) with an in-process transport
+# (-N ipc://). Kept after the layers above so that they stay cached.
+RUN apt-get update && apt-get install -y \
+    libgraphviz-dev \
+    libcap-dev \
+    llvm-18-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY fuzzers/aflnet-real /workspace/fuzzers/aflnet-real
+RUN cd /workspace/fuzzers/aflnet-real && \
+    rm -rf aflnet && \
+    LLVM_CONFIG=llvm-config-18 ./build_aflnet_real.sh
+
+# AFLNet-pp: AFLNet's algorithm on the same AFL++ commit as above
+COPY fuzzers/aflnet-pp /workspace/fuzzers/aflnet-pp
+RUN cd /workspace/fuzzers/aflnet-pp && \
+    rm -rf aflpp && \
+    ./build_aflnet_pp.sh
+
 CMD ["/bin/bash"]

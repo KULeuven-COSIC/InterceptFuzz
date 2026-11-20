@@ -11,7 +11,11 @@ crashes found by replaying the non-minimized queue on the ASan build.
 On OpenThread Nexus, the rule names are the signature IDs of the paper (C1--C7);
 on ns-3, the signatures are the rule categories "Crash N". The time to first exposure (TTE) is the time encoded in the name
 of the first crashing input (time:<ms>), shifted by the start time of its epoch for
-InterceptFuzz, whose epochs run as separate AFL++ instances.
+InterceptFuzz, whose epochs run as separate AFL++ instances. AFLNet-real names its
+inputs standalone_state_<unix ms>.bin; its TTE is that time minus start_time in the
+run's fuzzer_stats.
+The extra fuzzers (AFLNet-pp, AFLNet-real) are included when the results folder has
+runs of them.
 """
 import sys, re, glob
 from common import *
@@ -45,17 +49,31 @@ def first_exposure(run):
             if line.startswith('start_time'):
                 offs[it] = int(line.split(':')[1])
     t0 = min(offs.values()) if offs else None
+    start = None  # AFLNet-real: absolute timestamps in the file names
+    fs = find(run, 'fuzzer_stats')
+    if fs:
+        for line in open(fs):
+            if line.startswith('start_time'):
+                start = int(line.split(':')[1])
     out = {}
     for e in summary(run):
         if not is_signature(e['category']):
             continue
         n = e['category']
         fn = os.path.basename(e.get('first_file') or e['file'])
-        t = int(re.search(r'time:(\d+)', fn).group(1)) / 1000
+        m_time = re.search(r'time:(\d+)', fn)
+        m_abs = re.match(r'standalone_state_(\d+)\.bin$', fn)
+        if m_time:
+            t = int(m_time.group(1)) / 1000
+        elif m_abs and start is not None:
+            t = int(m_abs.group(1)) / 1000 - start
+        else:
+            out.setdefault(n, None)  # found, but no time in the name
+            continue
         m = re.match(r'iter_(\d+)_', fn)
         if m:
             t += offs[int(m.group(1))] - t0
-        out[n] = min(out.get(n, 1e18), t / 3600)
+        out[n] = min(out.get(n) if out.get(n) is not None else 1e18, t / 3600)
     return out
 
 
@@ -64,14 +82,15 @@ ot = os.path.join(root, OT)
 
 print('=== Table III (OpenThread Nexus) ===')
 per = {}
-for f, sub in FUZZERS['OpenThread Nexus'].items():
+for f, sub in all_fuzzers(root, 'OpenThread Nexus').items():
     R = [first_exposure(x) for x in runs(ot, sub)]
     per[f] = [len([c for c in s if c in OT_SIG]) for s in R]
     print(f'-- {f} ({len(R)} runs)')
     for sig in OT_SIG:
-        v = [s[sig] for s in R if sig in s]
+        found = [s for s in R if sig in s]
+        v = [s[sig] for s in found if s[sig] is not None]
         tte = f'median TTE {st.median(v):.1f} h' if v else ''
-        print(f'   {sig}: {len(v)}/{len(R)} campaigns  {tte}')
+        print(f'   {sig}: {len(found)}/{len(R)} campaigns  {tte}')
     print(f'   signatures per campaign: median {fmt(st.median(per[f]))} [{min(per[f])}--{max(per[f])}], total exposures {sum(per[f])}')
 print(f'   InterceptFuzz vs Concat, signatures per campaign: p {pfmt(mannwhitney_p(per["InterceptFuzz"], per["Concat"]))}')
 
@@ -79,7 +98,7 @@ print('\n=== Table IV (ns-3) ===')
 for tgt in ('ns-3 Wi-Fi', 'ns-3 LTE'):
     print(f'-- {tgt}')
     cnt = {}
-    for f, sub in FUZZERS[tgt].items():
+    for f, sub in all_fuzzers(root, tgt).items():
         C = [categories(x) for x in runs(os.path.join(root, TARGETS[tgt]), sub)]
         cnt[f] = [len(c) for c in C]
         print(f'   {f:14} all campaigns {len(set().union(*C))}, per campaign {med_range(cnt[f], half_up=False)}')

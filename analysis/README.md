@@ -26,11 +26,19 @@ To regenerate everything at once:
 | Table IX (coverage breakdown) and the related appendix numbers (branches covered by only one fuzzer, DNS-SD) | `coverage_breakdown.py` |
 | TMF numbers in the appendix text | `tmf_table.py` |
 | Fig. 3 (coverage over time) | `plot_coverage_over_time.py <results> {ot,wifi,lte} out.pdf` |
+| Coverage over time of all fuzzers, including AFLNet-pp and AFLNet-real | `plot_coverage_all_fuzzers.py <results> {ot,wifi,lte} out.pdf` |
 | Consistency check of the coverage data | `data_check.py` |
+
+AFLNet-pp and AFLNet-real (`aflnet-pp/`, `aflnet-real/` next to the other fuzzers) are
+added to Tables II–IV whenever the results folder has runs of them; without them, the
+output is that of the first paper version. For AFLNet-real, execs/s is execs_total divided
+by the campaign length (its `fuzzer_stats` only has the speed at the end), and the TTE is
+the time in the crashing input's name (`standalone_state_<unix ms>.bin`) minus `start_time`
+in its `fuzzer_stats`.
 
 `common.py` holds the shared parts:
 
-- folder names
+- folder names, the fuzzers of the first paper version (`FUZZERS`) and the added ones (`EXTRA_FUZZERS`)
 - statistics: medians with [min–max], the two-sided Mann-Whitney U test, and Vargha-Delaney Â12
 - the coverage of the benign trace, which Table II and Fig. 3 use
 

@@ -3,9 +3,9 @@
 # Run the paper's fuzzing campaigns one after another on a set of CPU cores.
 #
 #   OpenThread (role BOTH), 24 h:  InterceptFuzz {5,10} iterations x {linear,uniform},
-#                                  Concat, AFLNet
+#                                  Concat, AFLNet, AFLNet-pp, AFLNet-real
 #   ns-3 (WIFI / LTE), 10 h:       InterceptFuzz 5 iterations x {linear,uniform},
-#                                  Concat, AFLNet
+#                                  Concat, AFLNet, AFLNet-pp, AFLNet-real
 #
 # Each campaign runs in its own container (run_docker.sh) and builds the targets
 # first (-b). The paper repeats every configuration 10 times; start several
@@ -32,7 +32,7 @@ show_help() {
     echo "  -C CORES     CPU cores for the containers (default: $CORES)"
     echo "  -n RUNS      Repetitions of every configuration (default: $RUNS)"
     echo "  -T SECONDS   Campaign duration (default: 86400 for openthread, 36000 for ns-3-dev)"
-    echo "  -f FUZZER    Only run configurations of this fuzzer (interceptfuzz, concat, aflnet)"
+    echo "  -f FUZZER    Only run configurations of this fuzzer (interceptfuzz, concat, aflnet, aflnet-pp, aflnet-real)"
     echo "  -h           Show this help"
 }
 
@@ -61,6 +61,8 @@ case "$TARGET" in
             "interceptfuzz 10 uniform"
             "concat"
             "aflnet"
+            "aflnet-pp"
+            "aflnet-real"
         )
         ;;
     ns-3-dev)
@@ -75,6 +77,8 @@ case "$TARGET" in
             "interceptfuzz 5 uniform"
             "concat"
             "aflnet"
+            "aflnet-pp"
+            "aflnet-real"
         )
         ;;
     *)

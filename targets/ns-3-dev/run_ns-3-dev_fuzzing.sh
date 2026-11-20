@@ -24,7 +24,7 @@ show_help() {
     echo "Run a fuzzing campaign on ns-3 (Wi-Fi or LTE)."
     echo ""
     echo "Required Arguments:"
-    echo "  -f, --fuzzer       Fuzzer to run: 'interceptfuzz', 'concat' or 'aflnet'"
+    echo "  -f, --fuzzer       Fuzzer to run: 'interceptfuzz', 'concat', 'aflnet', 'aflnet-pp' or 'aflnet-real'"
     echo "  -p, --protocol     Target protocol: 'WIFI' or 'LTE'"
     echo ""
     echo "Optional Arguments:"
@@ -32,8 +32,8 @@ show_help() {
     echo "  -T, --timeout      Campaign duration in seconds (default: 3600)"
     echo "  -n, --iter         InterceptFuzz: number of iterations (default: 5)"
     echo "  -D, --distribution InterceptFuzz: time split over iterations, 'linear' or 'uniform' (default: linear)"
-    echo "  -s, --seed         Concat: directory of 0xDEAD-delimited seeds (default: generated from the FSM)"
-    echo "  -j, --fsm          Concat: FSM JSON to generate the initial seeds from (default: init_fsm/<protocol>.json)"
+    echo "  -s, --seed         Concat, AFLNet-pp, AFLNet-real: directory of 0xDEAD-delimited seeds (default: generated from the FSM)"
+    echo "  -j, --fsm          Concat, AFLNet-pp, AFLNet-real: FSM JSON to generate the initial seeds from (default: init_fsm/<protocol>.json)"
     echo "  -h, --help         Show this help message and exit"
     echo ""
     echo "Any unrecognized argument, or anything after '--', is passed to the fuzzer's run script."
@@ -42,6 +42,8 @@ show_help() {
     echo "  $0 -f interceptfuzz -p WIFI -n 5 -D linear -T 36000 -b"
     echo "  $0 -f concat -p LTE -T 36000 -b"
     echo "  $0 -f aflnet -p WIFI -T 36000 -b"
+    echo "  $0 -f aflnet-pp -p WIFI -T 36000 -b"
+    echo "  $0 -f aflnet-real -p LTE -T 36000 -b"
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -131,9 +133,9 @@ case "$FUZZER" in
             "${EXTRA_RUN_ARGS[@]}"
         ;;
 
-    concat)
+    concat|aflnet-pp|aflnet-real)
         if [[ -n "$INIT_FSM_JSON" && -n "$SEED_DIR" ]]; then
-            echo "Error: Concat takes EITHER an FSM (-j/--fsm) OR a seed directory (-s/--seed), not both."
+            echo "Error: $FUZZER takes EITHER an FSM (-j/--fsm) OR a seed directory (-s/--seed), not both."
             exit 1
         elif [[ -z "$INIT_FSM_JSON" && -z "$SEED_DIR" ]]; then
             INIT_FSM_JSON="$PROJ_DIR/init_fsm/${PROTOCOL,,}.json"
@@ -146,18 +148,38 @@ case "$FUZZER" in
             SEED_ARGS=("-i" "$SEED_DIR")
         fi
 
-        echo "[*] Launching Concat..."
-        TARG_BIN="$PROJ_DIR/ns-3-dev-concat/build/scratch/fuzz/$TARGET_BIN"
-        RUN_SCRIPT="$PROJ_DIR/fuzzers/concat/run_concat.sh"
-
-        AFL_FUZZER_LOOPCOUNT=1 "$RUN_SCRIPT" \
-            -t "$TARG_BIN" \
-            -o "$OUT_DIR" \
-            -T "$TIMEOUT" \
-            -c "$COV_BIN" \
-            -r "$COV_SRC" \
-            "${SEED_ARGS[@]}" \
-            "${EXTRA_RUN_ARGS[@]}"
+        TARG_BIN="$PROJ_DIR/ns-3-dev-$FUZZER/build/scratch/fuzz/$TARGET_BIN"
+        if [[ "$FUZZER" == "aflnet-real" ]]; then
+            # AFLNet with the in-process transport (-N ipc://); same seeds as Concat
+            echo "[*] Launching AFLNet-real..."
+            "$PROJ_DIR/fuzzers/aflnet-real/run_aflnet_real.sh" \
+                -o "$OUT_DIR" \
+                -T "$TIMEOUT" \
+                -c "$COV_BIN" \
+                -r "$COV_SRC" \
+                -t "$TARG_BIN" \
+                -w \
+                "${SEED_ARGS[@]}" \
+                "${EXTRA_RUN_ARGS[@]}"
+        else
+            # Concat and AFLNet-pp (AFLNet's algorithm on AFL++) share seeds,
+            # target build and post-processing
+            if [[ "$FUZZER" == "concat" ]]; then
+                echo "[*] Launching Concat..."
+                RUN_SCRIPT="$PROJ_DIR/fuzzers/concat/run_concat.sh"
+            else
+                echo "[*] Launching AFLNet-pp..."
+                RUN_SCRIPT="$PROJ_DIR/fuzzers/aflnet-pp/run_aflnet_pp.sh"
+            fi
+            AFL_FUZZER_LOOPCOUNT=1 "$RUN_SCRIPT" \
+                -t "$TARG_BIN" \
+                -o "$OUT_DIR" \
+                -T "$TIMEOUT" \
+                -c "$COV_BIN" \
+                -r "$COV_SRC" \
+                "${SEED_ARGS[@]}" \
+                "${EXTRA_RUN_ARGS[@]}"
+        fi
         ;;
 
     aflnet)
@@ -178,7 +200,7 @@ case "$FUZZER" in
 
     *)
         echo "Error: Unknown fuzzer '$FUZZER'."
-        echo "Supported fuzzers: interceptfuzz, concat, aflnet"
+        echo "Supported fuzzers: interceptfuzz, concat, aflnet, aflnet-pp, aflnet-real"
         exit 1
         ;;
 esac

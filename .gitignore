@@ -5,6 +5,8 @@ runs/
 # Local build output
 fuzzers/aflnet/target/
 fuzzers/interceptfuzz/build/
+fuzzers/aflnet-pp/aflpp/
+fuzzers/aflnet-real/aflnet/
 __pycache__/
 # Paper data (see results/README.md): the archives and their unpacked contents
 # live in results/ but are not committed

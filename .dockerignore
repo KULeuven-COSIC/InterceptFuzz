@@ -3,6 +3,8 @@ runs/
 results/
 fuzzers/aflnet/target/
 fuzzers/interceptfuzz/build/
+fuzzers/aflnet-pp/aflpp/
+fuzzers/aflnet-real/aflnet/
 **/.git
 *.tar.gz
 *.tar.zst

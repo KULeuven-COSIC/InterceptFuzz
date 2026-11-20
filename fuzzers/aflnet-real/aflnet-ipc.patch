@@ -1,0 +1,791 @@
+diff --git a/Makefile b/Makefile
+index d068a20..4601a0b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -32,6 +32,11 @@ CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign -Wno-unused-result
+ 	      -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
+ 	      -DBIN_PATH=\"$(BIN_PATH)\"
+ 
++# AFLNet-IPC: allow overriding the bitmap size (must match llvm_mode build)
++ifdef MAP_SIZE_POW2
++  CFLAGS   += -DMAP_SIZE_POW2=$(MAP_SIZE_POW2)
++endif
++
+ ifneq "$(filter Linux GNU%,$(shell uname))" ""
+   LDFLAGS  += -ldl -lgvc -lcgraph -lm -lcap
+ endif
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index 93b3548..5e55916 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -488,7 +488,7 @@ void update_state_bitmap(){
+   for (u32 i = 0; i < state_count; i++) {
+     u32 cur_state = state_sequence[i];
+ 
+-    u16 map_ptr_idx = (prev_state * STATE_SIZE  + cur_state) % SHIFT_SIZE;
++    u32 map_ptr_idx = (prev_state * STATE_SIZE  + cur_state) % SHIFT_SIZE; // AFLNet-IPC: u32, SHIFT_SIZE may exceed 64K
+     trace_bits[map_ptr_idx]++;
+ 
+     prev_state = cur_state;
+@@ -1121,6 +1121,280 @@ HANDLE_RESPONSES:
+ }
+ /* End of AFLNet-specific variables & functions */
+ 
++/* ===================================================================== */
++/* AFLNet-IPC: in-process / simulated targets (-N ipc://)                */
++/* ===================================================================== */
++/*
++   Instead of talking to a server over a socket *after* it has been spawned,
++   the whole message sequence is written to the test case file *before* the
++   target runs, and the target's reactions are read back from a shared-memory
++   "outbox" *after* it terminated. Everything downstream of the transport
++   (state extraction, IPSM, region annotations, M1/M2/M3 selection, region
++   level mutations) is untouched: ipc_collect() fills response_buf,
++   response_bytes[] and messages_sent exactly like send_over_network() does.
++
++   Test case format written for the target, depending on -P:
++     -P THREAD (default, same input format as Concat / AFLNet-pp):
++       { [frame] DE AD }*
++       Each AFLNet message (region) ends with the 0xDEAD delimiter. Every
++       message is split on the delimiter exactly as the harness does and
++       re-emitted with a canonical delimiter, so every injected frame maps
++       to the message it came from (see ipc_normalize_message_delim()).
++     -P THREAD_LENPREFIX (all integers big-endian):
++       [u32 total_len] { [u32 frame_len][frame] }*
++       Each AFLNet message (region) is itself stored as [u32 BE len][frame];
++       the header is re-computed here so that havoc on the length bytes
++       cannot desynchronise the rest of the sequence (see
++       ipc_normalize_message()).
++
++   Outbox format (written by the target, see OUTBOX_SHMEM_ID):
++       [u32 native total_bytes] { [u8 dir][u8 type][u32 BE len][payload] }*
++       dir 0x00: observed request (ignored by the transport)
++       dir 0x01: response / output of the stack under test
++       dir 0x02: frame injected from the test case (one per frame, in order)
++   response_buf is the outbox body (without the 4-byte total), so protocol
++   parsers (extract_response_codes_*) see the raw entry stream.
++
++   Environment:
++       AFLNET_IPC_MAX_FRAME   cap each frame to N bytes (default: no cap)
++*/
++
++#define IPC_OUTBOX_SIZE   (1024 * 1024)
++#define IPC_DIR_REQUEST   0x00
++#define IPC_DIR_RESPONSE  0x01
++#define IPC_DIR_INJECTED  0x02
++
++u8   use_ipc = 0;
++static s32  ipc_shm_id = -1;
++static u8*  ipc_outbox = NULL;
++static u32  ipc_max_frame = 0;
++static u32* ipc_frame_owner = NULL;  /* frame index -> kl_messages index */
++static u32  ipc_frame_count = 0;
++static u32  ipc_message_count = 0;
++static u8   ipc_framing_delim = 0;   /* -P THREAD: 0xDEAD-delimited frames */
++static const u8 ipc_delim[2] = {0xDE, 0xAD};
++
++static void ipc_remove_shm(void) {
++  if (ipc_shm_id >= 0) shmctl(ipc_shm_id, IPC_RMID, NULL);
++}
++
++static void ipc_setup(void) {
++
++  u8* tmp = getenv("AFLNET_IPC_MAX_FRAME");
++  if (tmp) ipc_max_frame = atoi(tmp);
++
++  ipc_shm_id = shmget(IPC_PRIVATE, IPC_OUTBOX_SIZE, IPC_CREAT | IPC_EXCL | 0600);
++  if (ipc_shm_id < 0) PFATAL("AFLNet-IPC: shmget() for the outbox failed");
++
++  atexit(ipc_remove_shm);
++
++  u8* id_str = alloc_printf("%d", ipc_shm_id);
++  setenv("OUTBOX_SHMEM_ID", id_str, 1);
++  ck_free(id_str);
++
++  ipc_outbox = shmat(ipc_shm_id, NULL, 0);
++  if (ipc_outbox == (void *)-1) PFATAL("AFLNet-IPC: shmat() for the outbox failed");
++
++  memset(ipc_outbox, 0, 4);
++
++}
++
++static inline u32 ipc_read_be32(const u8* p) {
++  return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
++}
++
++static inline void ipc_write_be32(u8* p, u32 v) {
++  p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
++}
++
++/* Append the frames contained in one message to buf. A message normally is a
++   single [u32 BE len][frame]; it may contain several (AFLNet merges the tail
++   of long seeds into one message, see max_seed_region_count). A length that
++   overruns the message means "rest of the message"; fewer than 4 bytes are
++   taken verbatim as a frame. Empty frames are dropped (the harness ignores
++   them, so they would break the frame <-> injection mapping). */
++static void ipc_normalize_message(const u8* m, u32 msize, u32 owner,
++                                  u8** buf, u32* len) {
++
++  u32 cur = 0;
++
++  while (cur < msize) {
++
++    const u8* frame;
++    u32 flen;
++
++    if (msize - cur < 4) {
++      frame = m + cur;
++      flen  = msize - cur;
++      cur   = msize;
++    } else {
++      u32 l = ipc_read_be32(m + cur);
++      cur  += 4;
++      if (l > msize - cur) l = msize - cur;
++      frame = m + cur;
++      flen  = l;
++      cur  += l;
++    }
++
++    if (ipc_max_frame && flen > ipc_max_frame) flen = ipc_max_frame;
++    if (!flen) continue;
++
++    *buf = ck_realloc(*buf, *len + 4 + flen);
++    ipc_write_be32(*buf + *len, flen);
++    memcpy(*buf + *len + 4, frame, flen);
++    *len += 4 + flen;
++
++    ipc_frame_owner = ck_realloc(ipc_frame_owner, (ipc_frame_count + 1) * sizeof(u32));
++    ipc_frame_owner[ipc_frame_count++] = owner;
++
++  }
++
++}
++
++/* -P THREAD: append the frames of one message, each followed by the 0xDEAD
++   delimiter. The message is split on the delimiter exactly like the harness
++   splits the test case (empty frames are dropped there, so they are dropped
++   here as well to keep the frame <-> injection mapping). */
++static void ipc_add_frame_delim(const u8* frame, u32 flen, u32 owner,
++                                u8** buf, u32* len) {
++
++  if (ipc_max_frame && flen > ipc_max_frame) flen = ipc_max_frame;
++  if (!flen) return;
++
++  *buf = ck_realloc(*buf, *len + flen + sizeof(ipc_delim));
++  memcpy(*buf + *len, frame, flen);
++  memcpy(*buf + *len + flen, ipc_delim, sizeof(ipc_delim));
++  *len += flen + sizeof(ipc_delim);
++
++  ipc_frame_owner = ck_realloc(ipc_frame_owner, (ipc_frame_count + 1) * sizeof(u32));
++  ipc_frame_owner[ipc_frame_count++] = owner;
++
++}
++
++static void ipc_normalize_message_delim(const u8* m, u32 msize, u32 owner,
++                                        u8** buf, u32* len) {
++
++  u32 cur = 0, start = 0;
++
++  while (cur + sizeof(ipc_delim) <= msize) {
++    if (!memcmp(m + cur, ipc_delim, sizeof(ipc_delim))) {
++      ipc_add_frame_delim(m + start, cur - start, owner, buf, len);
++      cur  += sizeof(ipc_delim);
++      start = cur;
++    } else cur++;
++  }
++
++  if (start < msize) ipc_add_frame_delim(m + start, msize - start, owner, buf, len);
++
++}
++
++/* Write the current kl_messages to the test case; called before the target
++   is spawned. */
++static void ipc_deliver(void) {
++
++  kliter_t(lms) *it;
++  u32 hdr = ipc_framing_delim ? 0 : 4;
++  u8* buf = ck_alloc(4);
++  u32 len = hdr;
++
++  ipc_frame_count   = 0;
++  ipc_message_count = 0;
++
++  for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
++    if (ipc_framing_delim)
++      ipc_normalize_message_delim((u8*)kl_val(it)->mdata, kl_val(it)->msize,
++                                  ipc_message_count, &buf, &len);
++    else
++      ipc_normalize_message((u8*)kl_val(it)->mdata, kl_val(it)->msize,
++                            ipc_message_count, &buf, &len);
++    ipc_message_count++;
++  }
++
++  if (ipc_framing_delim) {
++    /* Never write an empty test case; a lone delimiter injects nothing. */
++    if (!len) { memcpy(buf, ipc_delim, sizeof(ipc_delim)); len = sizeof(ipc_delim); }
++  } else ipc_write_be32(buf, len - 4);
++
++  /* Same as AFL's original write_to_testcase() */
++  s32 fd = out_fd;
++
++  if (out_file) {
++    unlink(out_file); /* Ignore errors. */
++    fd = open(out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
++    if (fd < 0) PFATAL("Unable to create '%s'", out_file);
++  } else lseek(fd, 0, SEEK_SET);
++
++  ck_write(fd, buf, len, out_file);
++
++  if (!out_file) {
++    if (ftruncate(fd, len)) PFATAL("ftruncate() failed");
++    lseek(fd, 0, SEEK_SET);
++  } else close(fd);
++
++  ck_free(buf);
++
++  /* The target also resets it, but do not rely on that (e.g. early crash). */
++  memset(ipc_outbox, 0, 4);
++
++}
++
++/* Read the outbox after the target terminated and rebuild the state that
++   send_over_network() would have produced. */
++static void ipc_collect(void) {
++
++  u32 total, cur = 0, inj = 0, filled = 0;
++  s32 open_msg = -1;
++
++  if (response_buf) { ck_free(response_buf); response_buf = NULL; }
++  response_buf_size = 0;
++  if (response_bytes) { ck_free(response_bytes); response_bytes = NULL; }
++
++  total = *(u32*)ipc_outbox;
++  if (total > IPC_OUTBOX_SIZE - 4) total = IPC_OUTBOX_SIZE - 4;
++
++  response_buf = ck_alloc(total + 1);
++  memcpy(response_buf, ipc_outbox + 4, total);
++  response_buf_size = total;
++
++  response_bytes = ck_alloc((ipc_message_count ? ipc_message_count : 1) * sizeof(u32));
++
++  /* response_bytes[k] is cumulative (as with sockets): everything observed
++     before the first injected frame of the next consumed message. Messages
++     without frames get the same value as their predecessor, i.e. no
++     responses of their own. */
++  while (cur + 6 <= total) {
++
++    u8  dir = (u8)response_buf[cur];
++    u32 len = ipc_read_be32((u8*)response_buf + cur + 2);
++
++    if (len > total - cur - 6) break;
++
++    if (dir == IPC_DIR_INJECTED && inj < ipc_frame_count) {
++      s32 owner = (s32)ipc_frame_owner[inj++];
++      if (owner != open_msg) {
++        while (filled < (u32)owner) response_bytes[filled++] = cur;
++        open_msg = owner;
++      }
++    }
++
++    cur += 6 + len;
++
++  }
++
++  /* The last consumed message gets everything up to the end of the run;
++     messages that were never consumed get no responses of their own. */
++  while (filled < ipc_message_count) response_bytes[filled++] = cur;
++
++  /* Messages the target never consumed count as not sent (like a failed
++     send()): they are neither annotated nor saved. Keep at least one so
++     that a saved seed is never empty. */
++  messages_sent = (open_msg < 0) ? 1 : (u32)open_msg + 1;
++  if (messages_sent > ipc_message_count) messages_sent = ipc_message_count;
++  if (!messages_sent) messages_sent = 1;
++
++}
++/* End of AFLNet-IPC */
++
+ /* Get unix time in milliseconds */
+ 
+ static u64 get_cur_time(void) {
+@@ -3167,6 +3441,9 @@ static u8 run_target(char** argv, u32 timeout) {
+      execve(). There is a bit of code duplication between here and
+      init_forkserver(), but c'est la vie. */
+ 
++  /* AFLNet-IPC: the whole message sequence must exist before the target starts */
++  if (use_ipc) ipc_deliver();
++
+   if (dumb_mode == 1 || no_forkserver) {
+ 
+     child_pid = fork();
+@@ -3300,6 +3577,10 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+   }
+ 
++  /* AFLNet-IPC: the target has terminated, collect its trace before the
++     state sequence is extracted in update_state_bitmap() */
++  if (use_ipc) ipc_collect();
++
+   if (!WIFSTOPPED(status)) child_pid = 0;
+ 
+   getitimer(ITIMER_REAL, &it);
+@@ -8099,8 +8380,9 @@ static void usage(u8* argv0) {
+ 
+        "Settings for network protocol fuzzing (AFLNet):\n\n"
+ 
+-       "  -N netinfo    - server information (e.g., tcp://127.0.0.1/8554)\n"
+-       "  -P protocol   - application protocol to be tested (e.g., RTSP, FTP, DTLS12, DNS, SMTP, SSH, TLS)\n"
++       "  -N netinfo    - server information (e.g., tcp://127.0.0.1/8554), or\n"
++       "                  ipc:// for in-process targets (test case file + outbox shm)\n"
++       "  -P protocol   - application protocol to be tested (e.g., RTSP, FTP, DTLS12, DNS, SMTP, SSH, TLS, THREAD, THREAD_LENPREFIX)\n"
+        "  -D usec       - waiting time (in micro seconds) for the server to initialize\n"
+        "  -W msec       - waiting time (in miliseconds) for receiving the first response to each input sent\n"
+        "  -w usec       - waiting time (in micro seconds) for receiving follow-up responses\n"
+@@ -9007,8 +9289,16 @@ int main(int argc, char** argv) {
+         break;
+ 
+       case 'N': /* Network configuration */
+-        if (use_net) FATAL("Multiple -N options not supported");
+-        if (parse_net_config(optarg, &net_protocol, &net_ip, &net_port)) FATAL("Bad syntax used for -N. Check the network setting. [tcp/udp]://127.0.0.1/port");
++        if (use_net || use_ipc) FATAL("Multiple -N options not supported");
++
++        /* AFLNet-IPC: in-process transport through a test case file and a
++           shared-memory outbox instead of a socket */
++        if (!strncmp(optarg, "ipc://", 6)) {
++          use_ipc = 1;
++          break;
++        }
++
++        if (parse_net_config(optarg, &net_protocol, &net_ip, &net_port)) FATAL("Bad syntax used for -N. Check the network setting. [tcp/udp]://127.0.0.1/port or ipc://");
+ 
+         use_net = 1;
+         break;
+@@ -9094,6 +9384,15 @@ int main(int argc, char** argv) {
+         }else if (!strcmp(optarg, "SNMP")) {
+           extract_requests = &extract_requests_SNMP;
+           extract_response_codes = &extract_response_codes_SNMP;
++        } else if (!strcmp(optarg, "THREAD")) {
++          /* AFLNet-IPC: 0xDEAD-delimited requests, outbox type codes as states */
++          extract_requests = &extract_requests_delim;
++          extract_response_codes = &extract_response_codes_outbox;
++          ipc_framing_delim = 1;
++        } else if (!strcmp(optarg, "THREAD_LENPREFIX") || !strcmp(optarg, "OUTBOX")) {
++          /* AFLNet-IPC: [u32 BE len][frame] requests, outbox type codes as states */
++          extract_requests = &extract_requests_lenprefix;
++          extract_response_codes = &extract_response_codes_outbox;
+         } else {
+           FATAL("%s protocol is not supported yet!", optarg);
+         }
+@@ -9162,7 +9461,7 @@ int main(int argc, char** argv) {
+   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
+ 
+   //AFLNet - Check for required arguments
+-  if (!use_net) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
++  if (!use_net && !use_ipc) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554 or ipc://)");
+ 
+   if (!protocol_selected) FATAL("Please specify the protocol to be tested using the -P option");
+ 
+@@ -9233,6 +9532,10 @@ int main(int argc, char** argv) {
+ 
+   setup_post();
+   setup_shm();
++
++  /* AFLNet-IPC: create the outbox before the fork server is started so the
++     target inherits OUTBOX_SHMEM_ID */
++  if (use_ipc) ipc_setup();
+   init_count_class16();
+ 
+   setup_ipsm();
+diff --git a/aflnet.c b/aflnet.c
+index 4c21ead..2e001f4 100644
+--- a/aflnet.c
++++ b/aflnet.c
+@@ -756,6 +756,7 @@ region_t* extract_requests_dicom(unsigned char* buf, unsigned int buf_size, unsi
+     region_count++;
+     regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+     regions[region_count - 1].start_byte = start;
++    regions[region_count - 1].modifiable = 0;
+     regions[region_count - 1].end_byte = end;
+     regions[region_count - 1].state_sequence = NULL;
+     regions[region_count - 1].state_count = 0;
+@@ -2762,3 +2763,130 @@ u32 read_bytes_to_uint32(unsigned char* buf, unsigned int offset, int num_bytes)
+   }
+   return val;
+ }
++
++/* ===================================================================== */
++/* AFLNet-IPC: length-prefixed frames + outbox state codes               */
++/* (-P THREAD / THREAD_LENPREFIX; meant to be used with -N ipc://)       */
++/* ===================================================================== */
++
++/* Requests (-P THREAD_LENPREFIX): the seed / queue file is a sequence of
++   [u32 BE len][frame].
++   Each region includes its 4-byte header so that region-level mutations
++   (which copy whole regions between seeds) keep the framing intact.
++   A length that overruns the buffer turns the rest into one region; a
++   trailing remainder of fewer than 4 bytes is attached to the last region.
++   The transport re-frames every message before execution, so a region does
++   not need to be well-formed. */
++region_t* extract_requests_lenprefix(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
++{
++  region_t *regions = NULL;
++  unsigned int region_count = 0;
++  unsigned int cur = 0;
++
++  while (cur + 4 <= buf_size) {
++    unsigned int len = ((unsigned int)buf[cur] << 24) | ((unsigned int)buf[cur + 1] << 16) |
++                       ((unsigned int)buf[cur + 2] << 8) | (unsigned int)buf[cur + 3];
++    unsigned int end;
++
++    if (len > buf_size - cur - 4) end = buf_size - 1;
++    else end = cur + 4 + len - 1;
++
++    region_count++;
++    regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
++    regions[region_count - 1].start_byte = cur;
++    regions[region_count - 1].end_byte = end;
++    regions[region_count - 1].state_sequence = NULL;
++    regions[region_count - 1].state_count = 0;
++
++    cur = end + 1;
++  }
++
++  if (cur < buf_size) {
++    if (region_count) {
++      regions[region_count - 1].end_byte = buf_size - 1;
++    } else {
++      /* Fewer than 4 bytes: a single region (AFLNet requires at least one) */
++      region_count = 1;
++      regions = (region_t *)ck_realloc(regions, sizeof(region_t));
++      regions[0].start_byte = 0;
++      regions[0].end_byte = buf_size - 1;
++      regions[0].state_sequence = NULL;
++      regions[0].state_count = 0;
++    }
++  }
++
++  *region_count_ref = region_count;
++  return regions;
++}
++
++/* Requests (-P THREAD): the seed / queue file is { [frame] DE AD }*, the
++   input format of Concat. A region is everything up to and including
++   the delimiter (the same pattern as AFLNet's text protocols, e.g. RTSP
++   regions end with "\r\n\r\n"); a remainder without delimiter is the last
++   region. */
++region_t* extract_requests_delim(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
++{
++  region_t *regions = NULL;
++  unsigned int region_count = 0, start = 0, i = 0;
++
++  while (i + 2 <= buf_size) {
++    if (buf[i] == 0xDE && buf[i + 1] == 0xAD) {
++      unsigned int end = i + 1;
++      region_count++;
++      regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
++      regions[region_count - 1].start_byte = start;
++      regions[region_count - 1].modifiable = 0;
++      regions[region_count - 1].end_byte = end;
++      regions[region_count - 1].state_sequence = NULL;
++      regions[region_count - 1].state_count = 0;
++      start = end + 1;
++      i = start;
++    } else i++;
++  }
++
++  if (start < buf_size || !region_count) {
++    region_count++;
++    regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
++    regions[region_count - 1].start_byte = start;
++    regions[region_count - 1].modifiable = 0;
++    regions[region_count - 1].end_byte = buf_size ? buf_size - 1 : 0;
++    regions[region_count - 1].state_sequence = NULL;
++    regions[region_count - 1].state_count = 0;
++  }
++
++  *region_count_ref = region_count;
++  return regions;
++}
++
++/* Responses: buf is the outbox body written by the target,
++   { [u8 dir][u8 type][u32 BE len][payload] }*. Every entry with dir 0x01
++   (output of the stack under test) contributes its type byte as a state.
++   States are shifted by one because AFLNet reserves 0 for the initial
++   state, while 0 is a valid type (e.g. MLE Link Request). */
++unsigned int* extract_response_codes_outbox(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
++{
++  unsigned int *state_sequence = NULL;
++  unsigned int state_count = 0;
++  unsigned int cur = 0;
++
++  state_count++;
++  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
++  state_sequence[state_count - 1] = 0;
++
++  while (cur + 6 <= buf_size) {
++    unsigned int len = ((unsigned int)buf[cur + 2] << 24) | ((unsigned int)buf[cur + 3] << 16) |
++                       ((unsigned int)buf[cur + 4] << 8) | (unsigned int)buf[cur + 5];
++    if (len > buf_size - cur - 6) break;
++
++    if (buf[cur] == 0x01) {
++      state_count++;
++      state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
++      state_sequence[state_count - 1] = (unsigned int)buf[cur + 1] + 1;
++    }
++
++    cur += 6 + len;
++  }
++
++  *state_count_ref = state_count;
++  return state_sequence;
++}
+diff --git a/aflnet.h b/aflnet.h
+index 1d53011..1bedd8a 100644
+--- a/aflnet.h
++++ b/aflnet.h
+@@ -92,6 +92,7 @@ unsigned int* extract_response_codes_tftp(unsigned char* buf, unsigned int buf_s
+ unsigned int* extract_response_codes_SNTP(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_NTP(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ unsigned int* extract_response_codes_SNMP(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
++unsigned int* extract_response_codes_outbox(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref); /* AFLNet-IPC */
+ extern unsigned int* (*extract_response_codes)(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+ 
+ region_t* extract_requests_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+@@ -111,6 +112,8 @@ region_t* extract_requests_dhcp(unsigned char* buf, unsigned int buf_size, unsig
+ region_t* extract_requests_SNTP(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_NTP(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ region_t* extract_requests_SNMP(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
++region_t* extract_requests_lenprefix(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref); /* AFLNet-IPC */
++region_t* extract_requests_delim(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref); /* AFLNet-IPC */
+ extern region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+ 
+ // Network communication functions
+diff --git a/config.h b/config.h
+index b77c508..28054cf 100644
+--- a/config.h
++++ b/config.h
+@@ -325,7 +325,9 @@
+    problems with complex programs). You need to recompile the target binary
+    after changing this - otherwise, SEGVs may ensue. */
+ 
++#ifndef MAP_SIZE_POW2
+ #define MAP_SIZE_POW2       16
++#endif /* ^!MAP_SIZE_POW2 (override with make MAP_SIZE_POW2=N) */
+ #define MAP_SIZE            (1 << MAP_SIZE_POW2)
+ 
+ /* Half for storing code coverage, and half for storing state coverage */
+diff --git a/llvm_mode/Makefile b/llvm_mode/Makefile
+index 7617f91..2b3d8cf 100644
+--- a/llvm_mode/Makefile
++++ b/llvm_mode/Makefile
+@@ -36,6 +36,21 @@ CXXFLAGS    ?= -O3 -funroll-loops
+ CXXFLAGS    += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign \
+                -DVERSION=\"$(VERSION)\" -Wno-variadic-macros
+ 
++# AFLNet-IPC: allow overriding the bitmap size (must match the afl-fuzz build)
++ifdef MAP_SIZE_POW2
++  CFLAGS    += -DMAP_SIZE_POW2=$(MAP_SIZE_POW2)
++  CXXFLAGS  += -DMAP_SIZE_POW2=$(MAP_SIZE_POW2)
++endif
++
++# AFLNet-IPC: LLVM >= 13 defaults to (and LLVM >= 15/17 only supports) the new
++# pass manager, so the pass is loaded with -fpass-plugin= instead of -Xclang -load.
++LLVM_MAJOR  := $(shell $(LLVM_CONFIG) --version 2>/dev/null | sed 's/\..*//')
++LLVM_NEW_PM := $(shell test "$(LLVM_MAJOR)" -ge 13 2>/dev/null && echo 1 || echo 0)
++ifeq "$(LLVM_NEW_PM)" "1"
++  CFLAGS    += -DAFL_NEW_PM=1
++  CXXFLAGS  += -DAFL_NEW_PM=1
++endif
++
+ # Mark nodelete to work around unload bug in upstream LLVM 5.0+
+ CLANG_CFL    = `$(LLVM_CONFIG) --cxxflags` -Wl,-znodelete -fno-rtti -fpic $(CXXFLAGS)
+ CLANG_LFL    = `$(LLVM_CONFIG) --ldflags` $(LDFLAGS)
+diff --git a/llvm_mode/afl-clang-fast.c b/llvm_mode/afl-clang-fast.c
+index c154e01..6bcc823 100644
+--- a/llvm_mode/afl-clang-fast.c
++++ b/llvm_mode/afl-clang-fast.c
+@@ -130,11 +130,16 @@ static void edit_params(u32 argc, char** argv) {
+   cc_params[cc_par_cnt++] = "-fsanitize-coverage=trace-pc-guard";
+   cc_params[cc_par_cnt++] = "-mllvm";
+   cc_params[cc_par_cnt++] = "-sanitizer-coverage-block-threshold=0";
++#else
++#ifdef AFL_NEW_PM
++  /* AFLNet-IPC: new pass manager (LLVM >= 13) */
++  cc_params[cc_par_cnt++] = alloc_printf("-fpass-plugin=%s/afl-llvm-pass.so", obj_path);
+ #else
+   cc_params[cc_par_cnt++] = "-Xclang";
+   cc_params[cc_par_cnt++] = "-load";
+   cc_params[cc_par_cnt++] = "-Xclang";
+   cc_params[cc_par_cnt++] = alloc_printf("%s/afl-llvm-pass.so", obj_path);
++#endif
+ #endif /* ^USE_TRACE_PC */
+ 
+   cc_params[cc_par_cnt++] = "-Qunused-arguments";
+diff --git a/llvm_mode/afl-llvm-pass.so.cc b/llvm_mode/afl-llvm-pass.so.cc
+index c6aac8d..373b54f 100644
+--- a/llvm_mode/afl-llvm-pass.so.cc
++++ b/llvm_mode/afl-llvm-pass.so.cc
+@@ -40,15 +40,44 @@
+ 
+ #include "llvm/ADT/Statistic.h"
+ #include "llvm/IR/IRBuilder.h"
+-#include "llvm/IR/LegacyPassManager.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/Support/Debug.h"
++#include "llvm/Config/llvm-config.h"
++
++#ifdef AFL_NEW_PM
++/* AFLNet-IPC: new pass manager (LLVM >= 13). The instrumentation itself is
++   unchanged, only the registration differs. */
++#include "llvm/IR/PassManager.h"
++#include "llvm/Passes/PassBuilder.h"
++#include "llvm/Passes/PassPlugin.h"
++#else
++#include "llvm/IR/LegacyPassManager.h"
+ #include "llvm/Transforms/IPO/PassManagerBuilder.h"
++#endif
+ 
+ using namespace llvm;
+ 
++/* AFLNet-IPC: the instrumentation body lives in a free function so it can be
++   driven by both the legacy and the new pass manager. */
++static bool instrumentModule(Module &M);
++
+ namespace {
+ 
++#ifdef AFL_NEW_PM
++
++  struct AFLCoverage : public PassInfoMixin<AFLCoverage> {
++
++    PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
++      return instrumentModule(M) ? PreservedAnalyses::none()
++                                 : PreservedAnalyses::all();
++    }
++
++    static bool isRequired() { return true; }
++
++  };
++
++#else
++
+   class AFLCoverage : public ModulePass {
+ 
+     public:
+@@ -56,21 +85,25 @@ namespace {
+       static char ID;
+       AFLCoverage() : ModulePass(ID) { }
+ 
+-      bool runOnModule(Module &M) override;
+-
+-      // StringRef getPassName() const override {
+-      //  return "American Fuzzy Lop Instrumentation";
+-      // }
++      bool runOnModule(Module &M) override { return instrumentModule(M); }
+ 
+   };
+ 
+-}
++#endif
+ 
++}
+ 
++#ifndef AFL_NEW_PM
+ char AFLCoverage::ID = 0;
++#endif
+ 
++#if LLVM_VERSION_MAJOR >= 16
++#define AFL_NONE std::nullopt
++#else
++#define AFL_NONE None
++#endif
+ 
+-bool AFLCoverage::runOnModule(Module &M) {
++static bool instrumentModule(Module &M) {
+ 
+   LLVMContext &C = M.getContext();
+ 
+@@ -131,14 +164,14 @@ bool AFLCoverage::runOnModule(Module &M) {
+ 
+       /* Load prev_loc */
+ 
+-      LoadInst *PrevLoc = IRB.CreateLoad(AFLPrevLoc);
+-      PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++      LoadInst *PrevLoc = IRB.CreateLoad(Int32Ty, AFLPrevLoc);
++      PrevLoc->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, AFL_NONE));
+       Value *PrevLocCasted = IRB.CreateZExt(PrevLoc, IRB.getInt32Ty());
+ 
+       /* Load SHM pointer */
+ 
+-      LoadInst *MapPtr = IRB.CreateLoad(AFLMapPtr);
+-      MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++      LoadInst *MapPtr = IRB.CreateLoad(PointerType::get(Int8Ty, 0), AFLMapPtr);
++      MapPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, AFL_NONE));
+       // Value *MapPtrIdx =
+       //     IRB.CreateGEP(MapPtr, IRB.CreateXor(PrevLocCasted, CurLoc));
+       /* Shift coverage feedback to the left by SHIFT_SIZE many elements
+@@ -146,22 +179,22 @@ bool AFLCoverage::runOnModule(Module &M) {
+         (((PrevLocCasted XOR PrevLocCasted) % (MAP_SIZE - SHIFT_SIZE)) + SHIFT_SIZE)
+       */
+       Value *MapPtrIdx =
+-          IRB.CreateGEP(MapPtr,
++          IRB.CreateGEP(Int8Ty, MapPtr,
+                         IRB.CreateAdd(IRB.CreateURem(IRB.CreateXor(PrevLocCasted, CurLoc), ConstantInt::get(Int32Ty, MAP_SIZE - SHIFT_SIZE)), ConstantInt::get(Int32Ty, SHIFT_SIZE)));
+ 
+       /* Update bitmap */
+ 
+-      LoadInst *Counter = IRB.CreateLoad(MapPtrIdx);
+-      Counter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++      LoadInst *Counter = IRB.CreateLoad(Int8Ty, MapPtrIdx);
++      Counter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, AFL_NONE));
+       Value *Incr = IRB.CreateAdd(Counter, ConstantInt::get(Int8Ty, 1));
+       IRB.CreateStore(Incr, MapPtrIdx)
+-          ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++          ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, AFL_NONE));
+ 
+       /* Set prev_loc to cur_loc >> 1 */
+ 
+       StoreInst *Store =
+           IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1), AFLPrevLoc);
+-      Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
++      Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, AFL_NONE));
+ 
+       inst_blocks++;
+ 
+@@ -184,6 +217,31 @@ bool AFLCoverage::runOnModule(Module &M) {
+ }
+ 
+ 
++#ifdef AFL_NEW_PM
++
++/* Equivalent of EP_ModuleOptimizerEarly / EP_EnabledOnOptLevel0: run once per
++   module at the start of the module optimizer (also at -O0). */
++extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
++llvmGetPassPluginInfo() {
++
++  return {LLVM_PLUGIN_API_VERSION, "AFLCoverage", "v0.1",
++          [](PassBuilder &PB) {
++#if LLVM_VERSION_MAJOR >= 16
++            PB.registerOptimizerEarlyEPCallback(
++#else
++            PB.registerOptimizerLastEPCallback(
++#endif
++                [](ModulePassManager &MPM, OptimizationLevel OL
++#if LLVM_VERSION_MAJOR >= 20
++                   , ThinOrFullLTOPhase
++#endif
++                   ) { MPM.addPass(AFLCoverage()); });
++          }};
++
++}
++
++#else
++
+ static void registerAFLPass(const PassManagerBuilder &,
+                             legacy::PassManagerBase &PM) {
+ 
+@@ -197,3 +255,5 @@ static RegisterStandardPasses RegisterAFLPass(
+ 
+ static RegisterStandardPasses RegisterAFLPass0(
+     PassManagerBuilder::EP_EnabledOnOptLevel0, registerAFLPass);
++
++#endif

@@ -21,7 +21,8 @@ show_help() {
     echo "Must be run from the directory containing the OpenThread environments (/workspace)."
     echo ""
     echo "Required Arguments:"
-    echo "  -f, --fuzzer FUZZER  interceptfuzz, concat, aflnet, all, coverage (coverage build only)"
+    echo "  -f, --fuzzer FUZZER  interceptfuzz, concat, aflnet, aflnet-pp, aflnet-real, all,"
+    echo "                       coverage (coverage build only)"
     echo "                       or asan (AddressSanitizer build only, for crash triage)"
     echo ""
     echo "Optional Arguments:"
@@ -55,8 +56,8 @@ fi
 FUZZING_MODE="MALICIOUS_${ROLE}"
 
 case "$FUZZER" in
-    interceptfuzz|concat|aflnet|coverage|asan) DIRS=("openthread-$FUZZER") ;;
-    all) DIRS=(openthread-interceptfuzz openthread-concat openthread-aflnet) ;;
+    interceptfuzz|concat|aflnet|aflnet-pp|aflnet-real|coverage|asan) DIRS=("openthread-$FUZZER") ;;
+    all) DIRS=(openthread-interceptfuzz openthread-concat openthread-aflnet openthread-aflnet-pp openthread-aflnet-real) ;;
     *) echo "Error: Unknown fuzzer '$FUZZER'."; show_help; exit 1 ;;
 esac
 [[ "$FUZZER" == "coverage" ]] && DIRS=()
@@ -155,11 +156,27 @@ build_environment "openthread-cov" "clang++" "clang" \
                   "$COV_CXXFLAGS" "$COV_LDFLAGS" \
                   "Coverage Target (gcov/lld)" "-DOT_COVERAGE=ON"
 
-# 2. Fuzzing environments: all three fuzzers use AFL++'s afl-clang-lto
+# 2. Fuzzing environments. All fuzzers use AFL++'s afl-clang-lto, except
+#    AFLNet-real: AFLNet's own afl-clang-fast keeps code coverage in the upper
+#    half of the bitmap (the lower half holds AFLNet's state feedback). lld
+#    because GNU ld is sensitive to the archive order that afl-clang-lto (lld)
+#    never had to care about.
+AFLNET_REAL_DIR="${AFLNET_REAL_DIR:-$(pwd)/fuzzers/aflnet-real/aflnet}"
 for d in "${DIRS[@]}"; do
-    build_environment "$d" "afl-clang-lto++" "afl-clang-lto" \
-                      "$FUZZ_CXXFLAGS" "" \
-                      "Fuzzing Target (${d#openthread-})"
+    if [[ "$d" == "openthread-aflnet-real" ]]; then
+        if [[ ! -x "$AFLNET_REAL_DIR/afl-clang-fast" ]]; then
+            echo "Error: '$AFLNET_REAL_DIR/afl-clang-fast' not found! Run fuzzers/aflnet-real/build_aflnet_real.sh first."
+            exit 1
+        fi
+        AFL_PATH="$AFLNET_REAL_DIR" build_environment "$d" \
+                      "$AFLNET_REAL_DIR/afl-clang-fast++" "$AFLNET_REAL_DIR/afl-clang-fast" \
+                      "$FUZZ_CXXFLAGS" "-fuse-ld=lld" \
+                      "Fuzzing Target (aflnet-real)"
+    else
+        build_environment "$d" "afl-clang-lto++" "afl-clang-lto" \
+                          "$FUZZ_CXXFLAGS" "" \
+                          "Fuzzing Target (${d#openthread-})"
+    fi
 done
 
 echo ""

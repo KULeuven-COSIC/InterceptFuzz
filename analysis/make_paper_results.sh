@@ -19,4 +19,8 @@ run "TMF numbers (Appendix B)"             python3 tmf_table.py          "$RES" 
 for t in ot wifi lte; do
     run "Fig. 3 ($t)"                      python3 plot_coverage_over_time.py "$RES" "$t" "$OUT/fig3_$t.pdf" > "$OUT/fig3_$t.txt"
 done
+# Coverage over time with AFLNet-pp and AFLNet-real (if the results contain them)
+for t in ot wifi lte; do
+    run "Coverage over time, all fuzzers ($t)" python3 plot_coverage_all_fuzzers.py "$RES" "$t" "$OUT/coverage_all_$t.pdf" > "$OUT/coverage_all_$t.txt"
+done
 echo "[+] Results in $OUT"
