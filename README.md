@@ -123,6 +123,10 @@ To collect the coverage of finished runs again (for example with other gcovr opt
 ./experiments/recollect_coverage.sh -t ns-3-dev -d runs/ns-3-dev/WIFI/36000s/aflnet -c 0-7 -- -p WIFI -b
 ```
 
+Add `-j` after `--` to also write the full gcovr report (`coverage.json`, per-line and
+per-branch counts) into each run, as needed by `analysis/coverage_breakdown.py`. Without
+`-i`/`-T`, only the final coverage is measured and `coverage_over_time.csv` is kept.
+
 InterceptFuzz records the final coverage of a campaign. To get the cumulative coverage
 after each iteration (written to `iter_XX/artifacts/coverage_before_minimize.txt` and picked
 up by `statistics.json`), run inside the target image:

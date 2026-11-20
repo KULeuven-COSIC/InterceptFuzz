@@ -20,6 +20,8 @@ usage() {
     echo ""
     echo "Optional Execution Options:"
     echo "  -b, --build   Call the build script before calculating coverage"
+    echo "  -j, --json    Also write the full gcovr report to <base_dir>/coverage.json"
+    echo "                (per-file coverage, analysis/coverage_breakdown.py)"
     echo ""
     echo "Extra Arguments:"
     echo "  Any unrecognized arguments, or anything placed after '--', will be passed"
@@ -33,6 +35,7 @@ ROLE=""
 BASE_DIR=""
 SEEDS_DIR=""
 BUILD_FLAG=0
+JSON_FLAG=0
 EXTRA_ARGS=()
 
 # Parse arguments passed to the container
@@ -43,6 +46,7 @@ while [[ "$#" -gt 0 ]]; do
         -B) BASE_DIR="$2"; shift 2 ;;
         -s) SEEDS_DIR="$2"; shift 2 ;;
         -b|--build) BUILD_FLAG=1; shift 1 ;;
+        -j|--json) JSON_FLAG=1; shift 1 ;;
         -h|--help) usage ;;
         --) 
             shift 1
@@ -139,6 +143,12 @@ fi
 
 echo "[*] Starting coverage analysis..."
 
+# Without -j, the coverage script writes the JSON report into $ROOT_DIR, which is lost with the container
+JSON_ARGS=()
+if [ "$JSON_FLAG" -eq 1 ]; then
+    JSON_ARGS=(-j "$OUT_JSON")
+fi
+
 # 2. Execute the main coverage script
 exec "$SCRIPT" \
     -t "$TARGET_BIN" \
@@ -147,6 +157,5 @@ exec "$SCRIPT" \
     -r "$ROOT_DIR" \
     -c "$OUT_CSV" \
     -w "$WRAPPER" \
+    "${JSON_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"
-
-# -j "$OUT_JSON" \

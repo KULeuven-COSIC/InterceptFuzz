@@ -23,7 +23,7 @@ To regenerate everything at once:
 | Table III (OpenThread crash signatures, TTE), Table IV (ns-3 signatures), Table VI signature columns | `crash_tables.py` |
 | Tables V, VII, VIII (Prefix Tree per epoch), RQ3/RQ4 tree numbers in the text | `tree_tables.py` |
 | RQ1/RQ3 numbers in the text taken from the coverage over time (when InterceptFuzz overtakes Concat, etc.) | `coverage_over_time_numbers.py` |
-| Table IX (coverage breakdown) and the related appendix numbers (branches covered by only one fuzzer, DNS-SD) | `coverage_breakdown.py` |
+| Table IX (coverage breakdown) and the related appendix numbers (branches covered by only one fuzzer, DNS-SD); with AFLNet-pp and AFLNet-real results, also an extended table with all five fuzzers | `coverage_breakdown.py` |
 | TMF numbers in the appendix text | `tmf_table.py` |
 | Fig. 3 (coverage over time) | `plot_coverage_over_time.py <results> {ot,wifi,lte} out.pdf` |
 | Coverage over time of all fuzzers, including AFLNet-pp and AFLNet-real | `plot_coverage_all_fuzzers.py <results> {ot,wifi,lte} out.pdf` |

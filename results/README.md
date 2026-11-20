@@ -68,7 +68,7 @@ Per run in the results archive:
 | `statistics.json` | coverage (lines, functions, branches) per InterceptFuzz epoch or at the end, executions, number of states |
 | `coverage_over_time.csv` | coverage of the coverage build over the campaign (replay of the queue in discovery order) |
 | `crash_summary.json` | crash signatures: output of `analysis/crashes/dedup_crashes.py` run on the run's `all_crashes/`, which also contains the crashes from the ASan replay of the non-minimized queue. Paths are relative to the run in the raw archive. |
-| `coverage.json.gz` | gcovr report with per-line and per-branch counts (OpenThread: AFLNet, Concat, InterceptFuzz 5L; Table IX) |
+| `coverage.json.gz` | gcovr report with per-line and per-branch counts (OpenThread: AFLNet, Concat, InterceptFuzz 5L for Table IX; AFLNet-pp and AFLNet-real for the extended table of `coverage_breakdown.py`) |
 | `fuzzer_stats` | AFL++/LibAFL/AFLNet statistics (Concat, AFLNet, AFLNet-pp, AFLNet-real; for AFLNet-real its `start_time` gives the crash TTE) |
 | `state_db.json.gz` | final Prefix Tree (InterceptFuzz) |
 | `iter_XX/state_db_{before_save_seeds,after_save_seeds,after_trimming}.json.gz` | Prefix Tree before Phase I, after Phase I and after Phase III of epoch XX (InterceptFuzz) |

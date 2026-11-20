@@ -13,10 +13,15 @@ branches covered only by InterceptFuzz / only by Concat across all campaigns
 InterceptFuzz and AFLNet (branch key without the function name, as in the paper), and
 the number of campaigns
 that reach the DNS-SD server (more than 5 branches in dnssd_server.cpp).
+
+When the results folder also has AFLNet-pp and AFLNet-real runs with gcovr reports,
+an extended table with all five fuzzers follows (extra information, not in the
+paper): the same rows, the branches covered by InterceptFuzz but never by the
+fuzzer and vice versa, and the DNS-SD numbers. The paper's part is unchanged.
 """
 import gzip, json, glob, collections, statistics as st, re, sys, os
 from decimal import Decimal, ROUND_HALF_UP
-from common import OT as OT_REL, FUZZERS, runs, find, root_arg
+from common import OT as OT_REL, FUZZERS, EXTRA_FUZZERS, runs, find, load_json, root_arg
 
 root = root_arg(sys.argv)
 OT = os.path.join(root, OT_REL)
@@ -31,13 +36,16 @@ FILES = ['coap/coap.cpp', 'meshcop/secure_transport.cpp', 'thread/address_resolv
          # further files with the largest differences between InterceptFuzz and AFLNet
          'thread/mle.cpp', 'thread/mle_ftd.cpp', 'thread/network_data.cpp', 'thread/router_table.cpp', 'thread/indirect_sender.cpp']
 
-def load(sub):
+def load(sub, required=True):
   out = []
   for run in runs(OT, sub):
-    f = find(run, 'coverage.json.gz')
+    f = find(run, 'coverage.json')   # also finds coverage.json.gz
     if f is None:
-      raise SystemExit(f'{run}: no coverage.json.gz')
-    d = json.load(gzip.open(f))
+      if required:
+        raise SystemExit(f'{run}: no coverage.json(.gz)')
+      print(f'% [!] {run}: no coverage.json(.gz), {sub} left out of the extended table', file=sys.stderr)
+      return None
+    d = load_json(f)
     tot = 0; dirs = collections.Counter(); fil = collections.Counter(); brs = set()
     for F in d['files']:
       path = F['file']; m = re.match(r'src/core/([^/]+)/', path); dk = m.group(1) if m else 'other'
@@ -75,3 +83,32 @@ print(f"% branches covered by IF but never by AFLNet: {len(v['IF'] - v['AFLNet']
 for g in order:
   n = sum(1 for x in res[g] if sum(c for p, c in x['fil'].items() if p.endswith('dnssd_server.cpp')) > 5)
   print(f'% {g}: DNS-SD server reached in {n} of {len(res[g])} campaigns')
+
+# ---- extended table with AFLNet-pp and AFLNet-real (not in the paper) ----
+extra = {}
+for g, sub in EXTRA_FUZZERS.items():
+  if runs(OT, sub):
+    x = load(sub, required=False)
+    if x:
+      extra[g] = x
+if extra:
+  res.update(extra)
+  order2 = order + list(extra)
+  names = {'AFLNet': 'AFLNet', 'SC': 'Concat', 'IF': 'InterceptFuzz'}
+  print('\n% Extended table (not in the paper), columns: ' + ', '.join(names.get(g, g) for g in order2)
+        + '; median [min--max] of covered branches')
+  for g in extra: print(f'% {g}: {len(res[g])} campaigns')
+  def row2(name, vals): return f'\t\t\t{name} & ' + ' & '.join(cell(v) for v in vals) + ' \\\\'
+  for k in D: print(row2(f'\\texttt{{{k}}}', [[x['dirs'][k] for x in res[g]] for g in order2]))
+  print(row2('Other', [[x['tot'] - sum(x['dirs'][k] for k in D) for x in res[g]] for g in order2]))
+  print(row2('\\textbf{Total}', [[x['tot'] for x in res[g]] for g in order2]))
+  for fi in FILES:
+    vals = [[sum(c for p, c in x['fil'].items() if p.endswith('/' + fi)) for x in res[g]] for g in order2]
+    print(row2('\\texttt{' + fi.split('/')[1].replace('_', '\\_') + '}', vals))
+  for g in extra:
+    v[g] = {(p, l, b) for x in res[g] for p, l, f, b in x['brs']}
+    print(f"% branches covered by IF but never by {g}: {len(v['IF'] - v[g])}; "
+          f"covered by {g} but never by IF: {len(v[g] - v['IF'])}  (key: file, line, branch number)")
+  for g in extra:
+    n = sum(1 for x in res[g] if sum(c for p, c in x['fil'].items() if p.endswith('dnssd_server.cpp')) > 5)
+    print(f'% {g}: DNS-SD server reached in {n} of {len(res[g])} campaigns')
