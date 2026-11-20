@@ -7,8 +7,17 @@ The campaigns behind every table and figure of the paper. There are two archives
 | `interceptfuzz-results.tar.gz` | per-run statistics, coverage, crash signatures, Prefix Trees | all tables and Fig. 3 (`analysis/`) |
 | `interceptfuzz-raw.tar.zst` | the replayable queue and crashing inputs of every run | measuring coverage again, triaging crashes again |
 
-Both archives are kept in this folder and are not committed (see `.gitignore`).
-TODO: publish them (e.g. on Zenodo) and link them here.
+The archives are not committed (see `.gitignore`). They are attached to the
+[`arxiv-v1` release](https://github.com/KULeuven-COSIC/InterceptFuzz/releases/tag/arxiv-v1),
+the version of the [arXiv paper](https://arxiv.org/abs/2611.03709). Download them into this folder:
+
+```bash
+REL=https://github.com/KULeuven-COSIC/InterceptFuzz/releases/download/arxiv-v1
+wget -P results/ $REL/interceptfuzz-results.tar.gz
+wget -P results/ $REL/interceptfuzz-raw.tar.zst      # only to redo the measurements
+```
+
+or, with the GitHub CLI, `gh release download arxiv-v1 -D results/`.
 
 Unpack the results archive here and regenerate the tables and figures:
 
